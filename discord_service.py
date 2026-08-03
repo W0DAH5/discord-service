@@ -24,26 +24,36 @@ if not RENDER_URL or not TOKEN or not DISCORD_EMAIL:
     logger.error("RENDER_BACKEND_URL, WEB_UI_TOKEN, DISCORD_EMAIL are required")
     sys.exit(1)
 
-# --- Fetch Discord sources from main backend ---
-async def fetch_discord_sources():
+# Ensure data directory exists
+DATA_DIR = Path("/tmp/discord_data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Fetch Discord sources from main backend with retries ---
+async def fetch_discord_sources(retries=5, delay=5):
     url = f"{RENDER_URL}/api/sources"
     headers = {"X-Forwarder-Token": TOKEN}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    sources = data.get("sources", [])
-                    discord_sources = [s for s in sources if s["platform"] == "discord" and s["enabled"]]
-                    channel_ids = [s["channel_id"] for s in discord_sources]
-                    logger.info(f"Fetched {len(channel_ids)} Discord sources")
-                    return channel_ids
-                else:
-                    logger.error(f"Failed to fetch sources: {resp.status}")
-                    return []
-    except Exception as e:
-        logger.error(f"Error fetching sources: {e}")
-        return []
+    for attempt in range(1, retries + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        sources = data.get("sources", [])
+                        discord_sources = [s for s in sources if s["platform"] == "discord" and s["enabled"]]
+                        channel_ids = [s["channel_id"] for s in discord_sources]
+                        logger.info(f"Fetched {len(channel_ids)} Discord sources")
+                        return channel_ids
+                    elif resp.status in (429, 502, 503):
+                        logger.warning(f"Received HTTP {resp.status}, retrying in {delay}s...")
+                        await asyncio.sleep(delay * attempt)
+                    else:
+                        logger.error(f"Failed to fetch sources: {resp.status}")
+                        return []
+        except Exception as e:
+            logger.error(f"Error fetching sources (attempt {attempt}): {e}")
+            await asyncio.sleep(delay * attempt)
+    logger.error("Max retries exceeded for fetching sources")
+    return []
 
 # --- Forwarding function ---
 async def forward_to_backend(channel_id, message_id, attachments, timestamp):
@@ -99,7 +109,7 @@ async def main():
         channels=channels,
         transformer=DummyTransformer(),
         on_message_callback=on_scraped_message,
-        data_dir=Path("/tmp/discord_data"),
+        data_dir=DATA_DIR,
         headless=True,
         store=None,
         run_lock=None
@@ -114,7 +124,7 @@ async def main():
         while True:
             await asyncio.sleep(60)
             new_channels = await fetch_discord_sources()
-            if set(new_channels) != set(channels):
+            if new_channels is not None and set(new_channels) != set(channels):
                 logger.info(f"Channel list changed: {new_channels}")
                 # Stop current poll loop
                 poll_task.cancel()

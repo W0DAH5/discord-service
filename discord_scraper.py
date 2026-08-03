@@ -198,7 +198,7 @@ class DiscordScraper:
         self._ch_stats: dict[str, dict[str, int]] = {}
         self._download_stats = {"success": 0, "failed": 0, "total_bytes": 0}
         self.user_data_dir = data_dir / "chrome_user_data"
-        self.user_data_dir.mkdir(exist_ok=True)
+        self.user_data_dir.mkdir(parents=True, exist_ok=True)
 
         # Internal flag to track if browser is launched
         self._browser_ready = False
