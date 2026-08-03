@@ -243,6 +243,9 @@ class DiscordScraper:
             timezone_id="America/New_York",
         )
 
+    # ------------------------------------------------------------------
+    # Ensure browser and login (AGGRESSIVE CHECK)
+    # ------------------------------------------------------------------
     async def _ensure_browser_and_login(self):
         if self._browser_ready and self.context is not None:
             return
@@ -261,26 +264,31 @@ class DiscordScraper:
         test_url = f"https://discord.com/channels/{guild_id}/{test_channel}" if test_channel else "https://discord.com/channels/@me"
         logger.info(f"Test URL: {test_url}")
 
-        # Navigate and wait for the page to load
         await self._page.goto(test_url, wait_until="networkidle", timeout=30000)
         await asyncio.sleep(2)
 
-        # Double-check login status using the strict method
+        # Check login status
         if await self._is_logged_in(self._page):
-            # Even if `_is_logged_in` says True, verify by looking for a login form again
-            email_input = await self._page.query_selector('input[name="email"]')
-            if email_input:
-                logger.info("Login form still present – forcing login")
+            # Look for a "Log In" button (login overlay)
+            login_button = await self._page.query_selector('button:has-text("Log In")')
+            if login_button:
+                logger.info("Found 'Log In' button – forcing login")
                 await self._perform_login(self._page)
             else:
-                logger.info("✓ Using existing Discord session")
-                self._browser_ready = True
-                return
+                # Also check for email input as a fallback
+                email_input = await self._page.query_selector('input[name="email"]')
+                if email_input:
+                    logger.info("Found email input – forcing login")
+                    await self._perform_login(self._page)
+                else:
+                    logger.info("✓ Using existing Discord session")
+                    self._browser_ready = True
+                    return
         else:
             logger.info("Not logged in – performing login...")
             await self._perform_login(self._page)
 
-        # After login, verify that we are on a channels page
+        # After login, verify we are on a channels page
         await self._page.wait_for_load_state("networkidle", timeout=10000)
         await asyncio.sleep(2)
         if not await self._is_logged_in(self._page):
@@ -443,10 +451,9 @@ class DiscordScraper:
                 continue
 
     # ------------------------------------------------------------------
-    # Message loading (unchanged from last update with debug_dir etc.)
+    # Message loading
     # ------------------------------------------------------------------
     async def _find_scroller(self, page: Page):
-        # Try a wider set of selectors that match current Discord
         selectors = [
             'div[data-list-id="chat-messages"]',
             'div[class*="scroller-"][class*="messages"]',
