@@ -244,7 +244,7 @@ class DiscordScraper:
         )
 
     # ------------------------------------------------------------------
-    # Ensure browser and login (AGGRESSIVE CHECK)
+    # Ensure browser and login (AGGRESSIVE CHECK - URL-independent)
     # ------------------------------------------------------------------
     async def _ensure_browser_and_login(self):
         if self._browser_ready and self.context is not None:
@@ -261,40 +261,54 @@ class DiscordScraper:
             guild_id = self._channel_guilds[test_channel]
         else:
             guild_id = self.GUILD_ID
-        test_url = f"https://discord.com/channels/{guild_id}/{test_channel}" if test_channel else "https://discord.com/channels/@me"
-        logger.info(f"Test URL: {test_url}")
+
+        test_url = (
+            f"https://discord.com/channels/{guild_id}/{test_channel}"
+            if test_channel
+            else "https://discord.com/channels/@me"
+        )
+        logger.info(f"Navigating to test URL: {test_url}")
 
         await self._page.goto(test_url, wait_until="networkidle", timeout=30000)
         await asyncio.sleep(2)
 
-        # Check login status
-        if await self._is_logged_in(self._page):
-            # Look for a "Log In" button (login overlay)
-            login_button = await self._page.query_selector('button:has-text("Log In")')
-            if login_button:
-                logger.info("Found 'Log In' button – forcing login")
-                await self._perform_login(self._page)
-            else:
-                # Also check for email input as a fallback
-                email_input = await self._page.query_selector('input[name="email"]')
-                if email_input:
-                    logger.info("Found email input – forcing login")
-                    await self._perform_login(self._page)
-                else:
-                    logger.info("✓ Using existing Discord session")
-                    self._browser_ready = True
-                    return
-        else:
-            logger.info("Not logged in – performing login...")
-            await self._perform_login(self._page)
+        # ----------------------------------------------------------------
+        # THE REAL CHECK: does the message list exist in the DOM?
+        # This works regardless of what the URL says.
+        # ----------------------------------------------------------------
+        message_list = await self._page.query_selector('[data-list-id="chat-messages"]')
+        if message_list:
+            logger.info("✓ Message list found – session is valid, already logged in")
+            self._browser_ready = True
+            return
 
-        # After login, verify we are on a channels page
-        await self._page.wait_for_load_state("networkidle", timeout=10000)
-        await asyncio.sleep(2)
-        if not await self._is_logged_in(self._page):
-            raise RuntimeError("Login failed – still not logged in")
+        # Message list NOT found → we are on a login page or overlay
+        logger.info("Message list not found – session invalid, forcing login...")
+        await self._perform_login(self._page)
 
-        logger.info("✓ Login confirmed – ready to poll")
+        # Post-login verification
+        await self._page.wait_for_load_state("networkidle", timeout=15000)
+        await asyncio.sleep(3)
+
+        message_list_after = await self._page.query_selector('[data-list-id="chat-messages"]')
+        if not message_list_after:
+            # Take a debug screenshot before raising
+            if self.debug_dir:
+                self.debug_dir.mkdir(parents=True, exist_ok=True)
+                await self._page.screenshot(
+                    path=str(self.debug_dir / "login_failed.png")
+                )
+                html = await self._page.content()
+                (self.debug_dir / "login_failed.html").write_text(html, encoding="utf-8")
+                logger.error(
+                    f"Login failed debug files saved to {self.debug_dir}"
+                )
+            raise RuntimeError(
+                "Login failed – message list still not found after login attempt. "
+                f"Current URL: {self._page.url}"
+            )
+
+        logger.info("✓ Login confirmed – message list present, ready to poll")
         self._browser_ready = True
 
     async def _close_browser(self):
@@ -318,62 +332,97 @@ class DiscordScraper:
             logger.info("Discord browser closed")
 
     # ------------------------------------------------------------------
-    # Login helpers – STRICT DETECTION
+    # Login – waits for real DOM confirmation, handles 2FA
+    # ------------------------------------------------------------------
+    async def _perform_login(self, page: Page):
+        logger.info("Navigating to Discord login page...")
+        await page.goto("https://discord.com/login", wait_until="networkidle", timeout=20000)
+        await asyncio.sleep(1)
+
+        # Fill credentials
+        try:
+            await page.wait_for_selector('input[name="email"]', timeout=10000)
+        except Exception:
+            raise RuntimeError("Login page did not load – email input not found")
+
+        await page.fill('input[name="email"]', self.email)
+        await asyncio.sleep(0.4)
+        await page.fill('input[name="password"]', self.password)
+        await asyncio.sleep(0.4)
+        await page.click('button[type="submit"]')
+        logger.info("Login form submitted – waiting for response...")
+
+        # Wait up to 60 seconds for login to complete
+        for attempt in range(30):
+            await asyncio.sleep(2)
+
+            # Success: message list appeared
+            message_list = await page.query_selector('[data-list-id="chat-messages"]')
+            if message_list:
+                logger.info(f"✓ Login successful (confirmed after {(attempt+1)*2}s)")
+                return
+
+            # 2FA required
+            twofa_input = await page.query_selector('input[name="code"]')
+            if twofa_input:
+                logger.warning("⚠ 2FA required – waiting up to 120s for manual entry...")
+                for twofa_attempt in range(60):
+                    await asyncio.sleep(2)
+                    if await page.query_selector('[data-list-id="chat-messages"]'):
+                        logger.info(
+                            f"✓ 2FA completed – logged in "
+                            f"(after {(twofa_attempt+1)*2}s)"
+                        )
+                        return
+                raise RuntimeError("2FA not completed within 120 second timeout")
+
+            # Detect wrong password / error messages early
+            error_el = await page.query_selector('[class*="errorMessage"], [class*="error-"]')
+            if error_el:
+                error_text = await error_el.text_content()
+                raise RuntimeError(f"Discord login error: {error_text.strip()}")
+
+            logger.debug(
+                f"Waiting for login... attempt {attempt+1}/30 | URL: {page.url}"
+            )
+
+        raise RuntimeError(
+            f"Login failed after 60 seconds. "
+            f"Final URL: {page.url}. "
+            "Check credentials or 2FA requirement."
+        )
+
+    # ------------------------------------------------------------------
+    # is_logged_in – now just a thin wrapper (kept for _navigate_to_channel)
+    # NOTE: Prefer checking for '[data-list-id="chat-messages"]' directly.
     # ------------------------------------------------------------------
     async def _is_logged_in(self, page: Page) -> bool:
+        """
+        Lightweight check used during navigation.
+        Returns True only if the message list DOM element is present.
+        URL-based checks are explicitly avoided (unreliable).
+        """
         try:
-            # Wait for the page to settle
-            await page.wait_for_load_state("networkidle", timeout=5000)
-            
-            # If URL contains login, definitely not logged in
+            # Hard negative: login URL
             if "/login" in page.url:
                 return False
-            
-            # Check for login form inputs (if present, not logged in)
-            email_input = await page.query_selector('input[name="email"]')
-            if email_input:
-                return False
-            password_input = await page.query_selector('input[name="password"]')
-            if password_input:
-                return False
-            
-            # Check for a login button
-            login_button = await page.query_selector('button[type="submit"]')
-            if login_button:
-                # Only if it's on a login page (e.g., text "Log In")
-                button_text = await login_button.text_content()
-                if button_text and "Log In" in button_text:
-                    return False
-            
-            # If we see the sidebar or guilds list, assume logged in
-            sidebar = await page.query_selector('div[class*="sidebar"], nav[aria-label="Servers"]')
-            if sidebar:
-                return True
-            
-            # Fallback: if URL has /channels/ and no login form, assume logged in
-            return "/channels/" in page.url
-        except Exception:
-            return False
 
-    async def _perform_login(self, page: Page):
-        await page.goto("https://discord.com/login", wait_until="networkidle")
-        await asyncio.sleep(1)
-        await page.fill('input[name="email"]', self.email, timeout=10000)
-        await asyncio.sleep(0.5)
-        await page.fill('input[name="password"]', self.password, timeout=10000)
-        await asyncio.sleep(0.5)
-        await page.click('button[type="submit"]')
-        logger.info("Login form submitted")
-        # Wait for the login to complete
-        for _ in range(24):
-            await asyncio.sleep(5)
-            if await self._is_logged_in(page):
-                logger.info("✓ Login successful")
-                return
-            # If we see a 2FA input, warn
-            if await page.locator('input[name="code"]').count() > 0:
-                logger.warning("⚠ 2FA required – enter code in browser")
-        raise RuntimeError("Login failed after 2 minutes")
+            # The only reliable positive signal
+            message_list = await page.query_selector('[data-list-id="chat-messages"]')
+            if message_list:
+                return True
+
+            # Secondary: Discord sidebar (present when logged in, before channel loads)
+            sidebar = await page.query_selector(
+                'nav[aria-label="Servers sidebar"], '
+                'div[class*="sidebar-"] nav, '
+                'div[aria-label="Servers"]'
+            )
+            return sidebar is not None
+
+        except Exception as e:
+            logger.debug(f"_is_logged_in check failed: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Navigation
@@ -391,29 +440,37 @@ class DiscordScraper:
             self._page = await self.context.new_page()
 
         page = self._page
-        url = page.url
-        if channel_id in url:
+
+        # Already on the correct channel – skip navigation
+        if channel_id in page.url and await page.query_selector('[data-list-id="chat-messages"]'):
+            logger.debug(f"Already on channel {channel_id} with messages visible")
             return page
 
-        if "/login" in url or "/download" in url:
-            logger.warning("Session expired – re-logging in")
-            await self._perform_login(page)
-
-        # Use guild ID from mapping, fallback to class constant
         guild_id = self._channel_guilds.get(channel_id, self.GUILD_ID)
         if not guild_id:
             raise ValueError(f"No guild ID for channel {channel_id}")
+
         target = f"https://discord.com/channels/{guild_id}/{channel_id}"
         logger.info(f"Navigating to: {target}")
         await page.goto(target, wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(1)
 
-        if "/login" in page.url or "/download" in page.url:
-            logger.warning("Session expired during navigation – re-logging in")
+        # ----------------------------------------------------------------
+        # Session check AFTER navigation – use DOM, not URL
+        # ----------------------------------------------------------------
+        message_list = await page.query_selector('[data-list-id="chat-messages"]')
+        if not message_list:
+            logger.warning(
+                f"Message list not found after navigating to {channel_id} "
+                f"(URL: {page.url}) – session may have expired, re-logging in..."
+            )
             await self._perform_login(page)
             await page.goto(target, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(1)
 
         await self._wait_for_chat(page)
 
+        # Update guild ID cache from actual URL
         m = re.search(r"/channels/(\d+)/(\d+)", page.url)
         if m:
             self._channel_guilds[channel_id] = m.group(1)
