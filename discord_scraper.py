@@ -252,7 +252,7 @@ class DiscordScraper:
         self.context = await self._create_browser_context(self._playwright)
         self._page = await self.context.new_page()
 
-        # Determine test URL using the first channel's guild
+        # Determine test URL
         test_channel = self.channels[0] if self.channels else None
         if test_channel and test_channel in self._channel_guilds:
             guild_id = self._channel_guilds[test_channel]
@@ -265,15 +265,20 @@ class DiscordScraper:
         await self._page.goto(test_url, wait_until="networkidle", timeout=30000)
         await asyncio.sleep(2)
 
-        # Check if we are already logged in
+        # Double-check login status using the strict method
         if await self._is_logged_in(self._page):
-            logger.info("✓ Using existing Discord session")
-            self._browser_ready = True
-            return
-
-        # If not logged in, perform login
-        logger.info("Not logged in – performing login...")
-        await self._perform_login(self._page)
+            # Even if `_is_logged_in` says True, verify by looking for a login form again
+            email_input = await self._page.query_selector('input[name="email"]')
+            if email_input:
+                logger.info("Login form still present – forcing login")
+                await self._perform_login(self._page)
+            else:
+                logger.info("✓ Using existing Discord session")
+                self._browser_ready = True
+                return
+        else:
+            logger.info("Not logged in – performing login...")
+            await self._perform_login(self._page)
 
         # After login, verify that we are on a channels page
         await self._page.wait_for_load_state("networkidle", timeout=10000)
@@ -305,23 +310,38 @@ class DiscordScraper:
             logger.info("Discord browser closed")
 
     # ------------------------------------------------------------------
-    # Login helpers (UPDATED)
+    # Login helpers – STRICT DETECTION
     # ------------------------------------------------------------------
     async def _is_logged_in(self, page: Page) -> bool:
         try:
             # Wait for the page to settle
             await page.wait_for_load_state("networkidle", timeout=5000)
+            
             # If URL contains login, definitely not logged in
             if "/login" in page.url:
                 return False
+            
             # Check for login form inputs (if present, not logged in)
             email_input = await page.query_selector('input[name="email"]')
             if email_input:
                 return False
-            # Check for sidebar or guilds list
+            password_input = await page.query_selector('input[name="password"]')
+            if password_input:
+                return False
+            
+            # Check for a login button
+            login_button = await page.query_selector('button[type="submit"]')
+            if login_button:
+                # Only if it's on a login page (e.g., text "Log In")
+                button_text = await login_button.text_content()
+                if button_text and "Log In" in button_text:
+                    return False
+            
+            # If we see the sidebar or guilds list, assume logged in
             sidebar = await page.query_selector('div[class*="sidebar"], nav[aria-label="Servers"]')
             if sidebar:
                 return True
+            
             # Fallback: if URL has /channels/ and no login form, assume logged in
             return "/channels/" in page.url
         except Exception:
