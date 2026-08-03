@@ -103,6 +103,16 @@ class DummyTransformer:
     async def transform_video(self, path):
         return {"video": path, "thumbnail": None}
 
+# --- Debug file serving ---
+async def serve_debug(request):
+    filename = request.match_info.get('filename', '')
+    if filename not in ('debug.html', 'debug.png'):
+        return web.HTTPNotFound()
+    file_path = DATA_DIR / filename
+    if not file_path.exists():
+        return web.HTTPNotFound()
+    return web.FileResponse(file_path)
+
 # --- Health check endpoint ---
 async def health_check(request):
     return web.Response(text="OK")
@@ -110,6 +120,7 @@ async def health_check(request):
 async def start_http_server():
     app = web.Application()
     app.router.add_get('/health', health_check)
+    app.router.add_get('/debug/{filename}', serve_debug)   # new debug route
     port = int(os.environ.get('PORT', 8080))
     runner = web.AppRunner(app)
     await runner.setup()
@@ -135,7 +146,8 @@ async def main():
         headless=True,
         store=None,
         run_lock=None,
-        channel_guilds=channel_guilds,          # pass guild mapping
+        channel_guilds=channel_guilds,
+        debug_dir=DATA_DIR,                         # <-- pass debug dir
     )
 
     await scraper.start()

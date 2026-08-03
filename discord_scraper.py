@@ -172,6 +172,7 @@ class DiscordScraper:
         store: Optional[Store] = None,
         run_lock: Optional[asyncio.Lock] = None,
         channel_guilds: Optional[dict[str, str]] = None,
+        debug_dir: Optional[Path] = None,                      # <-- new parameter
     ):
         self.email = email
         self.password = password
@@ -183,6 +184,7 @@ class DiscordScraper:
         self.store = store
         self.run_lock = run_lock or asyncio.Lock()
         self._channel_guilds: dict[str, str] = dict(channel_guilds or {})
+        self.debug_dir = debug_dir or data_dir                  # <-- use provided or default
 
         self.start_date: datetime | None = None
         if start_date:
@@ -541,12 +543,14 @@ class DiscordScraper:
                 message_data = []
 
             # Debug: save HTML and screenshot if no messages extracted
-            if not message_data:
+            if not message_data and self.debug_dir:
+                self.debug_dir.mkdir(parents=True, exist_ok=True)
                 html = await page.content()
-                with open("/tmp/discord_page.html", "w", encoding="utf-8") as f:
+                debug_html_path = self.debug_dir / "debug.html"
+                with open(debug_html_path, "w", encoding="utf-8") as f:
                     f.write(html)
-                await page.screenshot(path="/tmp/discord_page.png")
-                logger.warning("No messages extracted. Saved HTML and screenshot to /tmp")
+                await page.screenshot(path=str(self.debug_dir / "debug.png"))
+                logger.warning(f"No messages extracted. Saved HTML and screenshot to {self.debug_dir}")
 
             new_count = 0
             for data in message_data:
