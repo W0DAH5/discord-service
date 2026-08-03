@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import os
 import random
 import re
 import shutil
@@ -19,6 +20,7 @@ from models import SourceInfo
 
 logger = logging.getLogger(__name__)
 
+# ---------- JavaScript message extraction ----------
 _EXTRACT_JS = r"""
 () => {
     const CDN_HOSTS = [
@@ -136,15 +138,6 @@ _EXTRACT_JS = r"""
 }
 """
 
-# JavaScript to inject a Discord auth token directly into localStorage
-_INJECT_TOKEN_JS = """
-(token) => {
-    // Store token in localStorage the same way Discord's app does
-    window.localStorage.setItem('token', JSON.stringify(token));
-    return true;
-}
-"""
-
 
 class DiscordScraper:
     GUILD_ID = "1510277023694590062"
@@ -210,8 +203,7 @@ class DiscordScraper:
         self._playwright = None
         self._last_processed: dict[str, int] = {}
 
-        # Token-based auth (preferred over email/password)
-        import os
+        # Token-based auth (preferred)
         self._discord_token: str | None = os.environ.get("DISCORD_TOKEN", "").strip() or None
         if self._discord_token:
             logger.info("✓ DISCORD_TOKEN found – will use token injection")
@@ -263,10 +255,12 @@ class DiscordScraper:
             ),
             locale="en-US",
             timezone_id="America/New_York",
+            bypass_csp=True,
+            ignore_https_errors=True,
         )
 
     # ------------------------------------------------------------------
-    # Token injection login (fixed: wait for localStorage)
+    # Token injection login
     # ------------------------------------------------------------------
     async def _login_with_token(self, page: Page) -> bool:
         if not self._discord_token:
@@ -276,14 +270,13 @@ class DiscordScraper:
         clean_token = self._discord_token.strip().strip('"').strip("'")
 
         try:
-            # Navigate to /login to establish storage context
             await page.goto(
                 "https://discord.com/login",
                 wait_until="domcontentloaded",
                 timeout=25000,
             )
 
-            # Wait for localStorage to be available
+            # Wait for localStorage to become available
             for tick in range(15):
                 await asyncio.sleep(1)
                 try:
@@ -318,15 +311,12 @@ class DiscordScraper:
                 return False
 
             logger.info("Token stored – reloading Discord...")
-
-            # Navigate to the main app
             await page.goto(
                 "https://discord.com/channels/@me",
                 wait_until="domcontentloaded",
                 timeout=25000,
             )
 
-            # Wait for authentication
             for tick in range(15):
                 await asyncio.sleep(2)
 
@@ -483,7 +473,6 @@ class DiscordScraper:
             pass
 
     async def _handle_2fa(self, page: Page, input_selector: str) -> bool:
-        import os
         secret = os.environ.get("DISCORD_TOTP_SECRET", "").strip()
         if not secret:
             logger.error("DISCORD_TOTP_SECRET not set")
@@ -562,7 +551,7 @@ class DiscordScraper:
             return 0
 
     # ------------------------------------------------------------------
-    # Browser health check (keep alive)
+    # Browser health check
     # ------------------------------------------------------------------
     async def _browser_healthy(self) -> bool:
         if self.context is None or self._page is None:
@@ -599,6 +588,25 @@ class DiscordScraper:
             shutil.rmtree(self.user_data_dir, ignore_errors=True)
             self.user_data_dir.mkdir(parents=True, exist_ok=True)
             self.context = await self._create_browser_context(self._playwright)
+
+        # If token is present, inject it via init script (runs before every page load)
+        if self._discord_token:
+            clean_token = self._discord_token.strip().strip('"').strip("'")
+            await self.context.add_init_script(f"""
+                (() => {{
+                    const TOKEN = '{clean_token}';
+                    const _orig = Storage.prototype.getItem;
+                    Storage.prototype.getItem = function(key) {{
+                        if (key === 'token') return JSON.stringify(TOKEN);
+                        return _orig.apply(this, arguments);
+                    }};
+                    window.addEventListener('DOMContentLoaded', () => {{
+                        try {{ localStorage.setItem('token', JSON.stringify(TOKEN)); }}
+                        catch(e) {{}}
+                    }});
+                }})();
+            """)
+            logger.info("Token init script registered on context")
 
         self._page = await self.context.new_page()
 
@@ -873,7 +881,6 @@ class DiscordScraper:
         initial_load = not self._initial_load_done.get(channel_id, False)
         last_id = self._last_processed.get(channel_id, 0)
 
-        # Memory: initial 30 scrolls, subsequent 10
         max_scrolls = 30 if initial_load else 10
 
         all_msgs = await self._load_messages(page, max_scrolls=max_scrolls)
@@ -1019,7 +1026,6 @@ class DiscordScraper:
 
             async with self.run_lock:
                 try:
-                    # Check browser health
                     if not await self._browser_healthy():
                         logger.warning("Browser died – relaunching")
                         await self._close_browser()
@@ -1077,12 +1083,10 @@ class DiscordScraper:
                 except Exception as e:
                     logger.exception(f"Poll cycle error: {e}")
 
-            # Wait between polls – browser stays open
             wait = random.uniform(60, 90)
             logger.info(f"Sleeping {wait:.0f}s until next poll")
             await asyncio.sleep(wait)
 
-        # Loop exited – close browser
         await self._close_browser()
 
     async def stop(self) -> None:
