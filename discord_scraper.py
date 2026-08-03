@@ -1,4 +1,3 @@
-# discord_scraper.py
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 from urllib.parse import urlparse, unquote
 
+import psutil
 from playwright.async_api import async_playwright, BrowserContext, Page
 
 from models import SourceInfo
@@ -21,7 +21,6 @@ from utils import sanitize_filename, unlink_quiet
 
 logger = logging.getLogger(__name__)
 
-# ---------- Updated JavaScript extraction ----------
 _EXTRACT_JS = r"""
 () => {
     const CDN_HOSTS = [
@@ -79,7 +78,6 @@ _EXTRACT_JS = r"""
     const messages = [];
     const seenIds = new Set();
 
-    // Find all message content elements (unique per message)
     const contentElements = document.querySelectorAll('[id^="message-content-"]');
     contentElements.forEach(el => {
         const idAttr = el.id;
@@ -112,7 +110,6 @@ _EXTRACT_JS = r"""
 
 
 class DiscordScraper:
-    # Fallback guild ID (used when no mapping is provided)
     GUILD_ID = "1510277023694590062"
 
     DISCORD_CDN_DOMAINS = {
@@ -123,32 +120,32 @@ class DiscordScraper:
         "images-ext-2.discordapp.net",
     }
 
-    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg", ".avif"}
-    VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".mpg", ".mpeg", ".avi", ".flv"}
-    DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".doc", ".docx", ".zip", ".rar", ".7z"}
-
     def __init__(
         self,
         email: str,
         password: str | None,
         channels: list[str],
+        transformer: MediaTransformer,                          # <-- THIS MUST BE HERE
         on_message_callback: Callable[[Any, SourceInfo], Coroutine[Any, Any, bool]],
         data_dir: Path,
         headless: bool = False,
         start_date: str | None = None,
+        store: Optional[Store] = None,
         run_lock: Optional[asyncio.Lock] = None,
         channel_guilds: Optional[dict[str, str]] = None,
     ):
         self.email = email
         self.password = password
         self.channels = channels
+        self.transformer = transformer
         self.on_message = on_message_callback
         self.data_dir = data_dir
         self.headless = headless
+        self.store = store
         self.run_lock = run_lock or asyncio.Lock()
+        self._channel_guilds = dict(channel_guilds or {})
 
-        self._channel_guilds: dict[str, str] = dict(channel_guilds or {})
-
+        # … rest of __init__ exactly as in the last update
         self.start_date: datetime | None = None
         if start_date:
             try:
@@ -168,7 +165,6 @@ class DiscordScraper:
         self._download_stats = {"success": 0, "failed": 0, "total_bytes": 0}
         self.user_data_dir = data_dir / "chrome_user_data"
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
-
         self._browser_ready = False
         self._playwright = None
 
