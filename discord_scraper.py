@@ -14,16 +14,14 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 from urllib.parse import urlparse, unquote
 
-import psutil
 from playwright.async_api import async_playwright, BrowserContext, Page
 
 from models import SourceInfo
 from utils import sanitize_filename, unlink_quiet
 
-# ---------- Unicode safe logging ----------
 logger = logging.getLogger(__name__)
 
-# ---------- JavaScript extraction (unchanged) ----------
+# ---------- Updated JavaScript extraction ----------
 _EXTRACT_JS = r"""
 () => {
     const CDN_HOSTS = [
@@ -55,26 +53,17 @@ _EXTRACT_JS = r"""
             const href = a.getAttribute('href');
             if (href && isMediaUrl(href)) urls.add(cleanUrl(href));
         });
-        el.querySelectorAll('img').forEach(img => {
-            for (const attr of ['src', 'data-safe-src', 'data-original-src',
-                                'data-src', 'data-url']) {
-                const v = img.getAttribute(attr);
-                if (v && isMediaUrl(v)) { urls.add(cleanUrl(v)); break; }
-            }
+        el.querySelectorAll('img[src]').forEach(img => {
+            const src = img.getAttribute('src');
+            if (src && isMediaUrl(src)) urls.add(cleanUrl(src));
         });
-        el.querySelectorAll('video, video source').forEach(v => {
-            for (const attr of ['src', 'data-src', 'data-url']) {
-                const s = v.getAttribute(attr);
-                if (s && isMediaUrl(s)) { urls.add(cleanUrl(s)); break; }
-            }
+        el.querySelectorAll('video[src]').forEach(video => {
+            const src = video.getAttribute('src');
+            if (src && isMediaUrl(src)) urls.add(cleanUrl(src));
         });
-        el.querySelectorAll('[data-attachment-url], [data-media-url], ' +
-                            '[data-original-filename]').forEach(d => {
-            for (const attr of ['data-attachment-url', 'data-media-url',
-                                'data-url', 'data-src']) {
-                const v = d.getAttribute(attr);
-                if (v && isMediaUrl(v)) { urls.add(cleanUrl(v)); break; }
-            }
+        el.querySelectorAll('[data-attachment-url]').forEach(d => {
+            const url = d.getAttribute('data-attachment-url');
+            if (url && isMediaUrl(url)) urls.add(cleanUrl(url));
         });
         el.querySelectorAll('[style*="discordapp"]').forEach(d => {
             const style = d.getAttribute('style') || '';
@@ -84,50 +73,31 @@ _EXTRACT_JS = r"""
                 if (isMediaUrl(inner)) urls.add(cleanUrl(inner));
             });
         });
-        el.querySelectorAll('a[class*="originalLink"], a[class*="imageWrapper"],' +
-                            'a[class*="anchor"]').forEach(a => {
-            const href = a.getAttribute('href');
-            if (href && isMediaUrl(href)) urls.add(cleanUrl(href));
-        });
         return [...urls].filter(Boolean);
     }
 
     const messages = [];
     const seenIds = new Set();
 
-    document.querySelectorAll('[data-list-item-id]').forEach(el => {
-        let rawId = el.getAttribute('data-list-item-id') || '';
-        let msgId = rawId;
-        if (msgId.includes('___')) {
-            msgId = msgId.split('___').pop();
-        }
-        const segments = msgId.split('-');
-        const last = segments[segments.length - 1];
-        if (/^\d+$/.test(last)) msgId = last;
-
+    // Find all message content elements (unique per message)
+    const contentElements = document.querySelectorAll('[id^="message-content-"]');
+    contentElements.forEach(el => {
+        const idAttr = el.id;
+        const msgId = idAttr.replace(/^message-content-/, '');
         if (!msgId || seenIds.has(msgId)) return;
         seenIds.add(msgId);
 
-        let ts = el.getAttribute('data-timestamp') || '';
-        if (!ts) {
-            const timeEl = el.querySelector('time[datetime]');
-            if (timeEl) ts = timeEl.getAttribute('datetime') || '';
-        }
+        let container = el.closest('div[class*="message"], li[role="article"]');
+        if (!container) container = el.parentElement;
 
-        let text = '';
-        const textEl = el.querySelector(
-            'div[class*="messageContent"], div[id^="message-content"],' +
-            'div[class*="markup-"], span[class*="text-"]'
-        );
-        if (textEl) text = (textEl.innerText || '').slice(0, 2000);
+        let ts = '';
+        const timeEl = document.getElementById('message-timestamp-' + msgId);
+        if (timeEl) ts = timeEl.getAttribute('datetime') || '';
 
-        const attachments = extractFromElement(el);
+        let text = (el.innerText || '').slice(0, 2000);
 
-        el.querySelectorAll(
-            'div[class*="embed"], div[class*="attachment"],' +
-            'div[class*="imageContainer"], div[class*="videoWrapper"],' +
-            'div[class*="mediaContainer"]'
-        ).forEach(embed => {
+        const attachments = extractFromElement(container);
+        container.querySelectorAll('div[class*="embed"], div[class*="attachment"], div[class*="imageContainer"]').forEach(embed => {
             extractFromElement(embed).forEach(u => {
                 if (!attachments.includes(u)) attachments.push(u);
             });
@@ -162,26 +132,21 @@ class DiscordScraper:
         email: str,
         password: str | None,
         channels: list[str],
-        transformer: MediaTransformer,
         on_message_callback: Callable[[Any, SourceInfo], Coroutine[Any, Any, bool]],
         data_dir: Path,
         headless: bool = False,
         start_date: str | None = None,
-        store: Optional[Store] = None,
         run_lock: Optional[asyncio.Lock] = None,
-        channel_guilds: Optional[dict[str, str]] = None,   # new parameter
+        channel_guilds: Optional[dict[str, str]] = None,
     ):
         self.email = email
         self.password = password
         self.channels = channels
-        self.transformer = transformer
         self.on_message = on_message_callback
         self.data_dir = data_dir
         self.headless = headless
-        self.store = store
         self.run_lock = run_lock or asyncio.Lock()
 
-        # Pre-populate guild mapping from external config
         self._channel_guilds: dict[str, str] = dict(channel_guilds or {})
 
         self.start_date: datetime | None = None
@@ -204,12 +169,11 @@ class DiscordScraper:
         self.user_data_dir = data_dir / "chrome_user_data"
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
 
-        # Internal flag to track if browser is launched
         self._browser_ready = False
         self._playwright = None
 
     # ------------------------------------------------------------------
-    # Browser lifecycle (deferred)
+    # Browser lifecycle
     # ------------------------------------------------------------------
     def _get_browser_args(self) -> list[str]:
         return [
@@ -240,7 +204,6 @@ class DiscordScraper:
         )
 
     async def _ensure_browser_and_login(self):
-        """Launch browser and ensure login – called only when we hold the lock."""
         if self._browser_ready and self.context is not None:
             return
 
@@ -249,12 +212,13 @@ class DiscordScraper:
         self.context = await self._create_browser_context(self._playwright)
         self._page = await self.context.new_page()
 
-        # Navigate to test channel to check login
+        # Use first channel's guild if available, otherwise fallback
         test_channel = self.channels[0] if self.channels else None
-        test_url = (
-            f"https://discord.com/channels/{self.GUILD_ID}/{test_channel}"
-            if test_channel else "https://discord.com/channels/@me"
-        )
+        guild_id = self.GUILD_ID
+        if test_channel and test_channel in self._channel_guilds:
+            guild_id = self._channel_guilds[test_channel]
+        test_url = f"https://discord.com/channels/{guild_id}/{test_channel}" if test_channel else "https://discord.com/channels/@me"
+        logger.info(f"Test URL: {test_url}")
         await self._page.goto(test_url, wait_until="networkidle")
         await asyncio.sleep(2)
 
@@ -283,7 +247,6 @@ class DiscordScraper:
         self._browser_ready = True
 
     async def _close_browser(self):
-        """Close the browser to free memory – called after releasing the lock."""
         if self.context is not None:
             try:
                 if self._page:
@@ -304,7 +267,7 @@ class DiscordScraper:
             logger.info("Discord browser closed")
 
     # ------------------------------------------------------------------
-    # Login helpers (unchanged)
+    # Login helpers
     # ------------------------------------------------------------------
     async def _is_logged_in(self, page: Page) -> bool:
         try:
@@ -345,7 +308,7 @@ class DiscordScraper:
         raise RuntimeError("Login failed after 2 minutes")
 
     # ------------------------------------------------------------------
-    # Navigation (relies on self._page, which is set after browser launch)
+    # Navigation
     # ------------------------------------------------------------------
     async def _page_alive(self, page: Page) -> bool:
         try:
@@ -355,7 +318,6 @@ class DiscordScraper:
             return False
 
     async def _navigate_to_channel(self, channel_id: str) -> Page:
-        """Navigate the shared page to the given channel."""
         if self._page is None or not await self._page_alive(self._page):
             logger.warning("Page is dead – recreating")
             self._page = await self.context.new_page()
@@ -369,7 +331,6 @@ class DiscordScraper:
             logger.warning("Session expired – re-logging in")
             await self._perform_login(page)
 
-        # Use guild ID from mapping (pre-populated or learned), fallback to class constant
         guild_id = self._channel_guilds.get(channel_id, self.GUILD_ID)
         if not guild_id:
             raise ValueError(f"No guild ID for channel {channel_id}")
@@ -383,7 +344,6 @@ class DiscordScraper:
 
         await self._wait_for_chat(page)
 
-        # Learn guild ID from URL (if not already known)
         m = re.search(r"/channels/(\d+)/(\d+)", page.url)
         if m:
             self._channel_guilds[channel_id] = m.group(1)
@@ -421,7 +381,7 @@ class DiscordScraper:
                 continue
 
     # ------------------------------------------------------------------
-    # Message loading (unchanged)
+    # Message loading
     # ------------------------------------------------------------------
     async def _find_scroller(self, page: Page):
         selectors = [
@@ -599,7 +559,11 @@ class DiscordScraper:
 
     async def _get_new_messages(self, channel_id: str, page: Page) -> list[dict]:
         initial_load = not self._initial_load_done.get(channel_id, False)
-        last_id = self.store.get_last_processed(channel_id) or 0 if self.store else 0
+        # For standalone service, store is not used; we keep the last processed in memory
+        # We'll store last processed per channel in a dict
+        if not hasattr(self, '_last_processed'):
+            self._last_processed = {}
+        last_id = self._last_processed.get(channel_id, 0)
 
         max_scrolls = 500 if initial_load else 15
         all_msgs = await self._load_messages(page, max_scrolls=max_scrolls)
@@ -615,7 +579,7 @@ class DiscordScraper:
                 msg_id_int = int(msg["id"])
             except ValueError:
                 msg_id_int = 0
-            if msg_id_int <= int(last_id):
+            if msg_id_int <= last_id:
                 continue
             new_msgs.append(msg)
 
@@ -629,11 +593,16 @@ class DiscordScraper:
         for msg in new_msgs:
             self._known_message_ids[channel_id].add(msg["id"])
 
+        # Update last processed ID
+        if new_msgs:
+            max_id = max(int(m["id"]) for m in new_msgs)
+            self._last_processed[channel_id] = max_id
+
         logger.info(f"Channel {channel_id}: {len(new_msgs)} new messages (last_id={last_id})")
         return new_msgs
 
     # ------------------------------------------------------------------
-    # Download (uses self.context – available after browser launch)
+    # Download
     # ------------------------------------------------------------------
     async def _download_attachment(
         self, url: str, dest: Path, retries: int = 5
@@ -673,7 +642,7 @@ class DiscordScraper:
         return None
 
     # ------------------------------------------------------------------
-    # Helper: normalize URL (unchanged)
+    # Helpers
     # ------------------------------------------------------------------
     def _normalize_url(self, url: str) -> str:
         if not url:
@@ -708,9 +677,6 @@ class DiscordScraper:
         self._known_message_ids[channel_id] = set()
         self._initial_load_done[channel_id] = False
 
-    # ------------------------------------------------------------------
-    # Process message (unchanged)
-    # ------------------------------------------------------------------
     async def _process_message(self, msg: dict, source_info: SourceInfo):
         class _MsgWrapper:
             def __init__(self, d):
@@ -744,15 +710,13 @@ class DiscordScraper:
                 self._track(channel_id, "failed")
 
     # ------------------------------------------------------------------
-    # Public methods: start, poll_channels, stop
+    # Public methods
     # ------------------------------------------------------------------
     async def start(self):
-        """Initialize scraper – does NOT launch browser."""
         self._running = True
         logger.info("Discord scraper initialized (browser will launch on first poll)")
 
     async def poll_channels(self):
-        """Main polling loop – acquires lock, launches browser, processes, then closes browser."""
         if not self._running:
             raise RuntimeError("Scraper not started – call start() first")
 
@@ -760,16 +724,13 @@ class DiscordScraper:
         poll_count = 0
 
         while self._running:
-            # Acquire lock – only one scraper at a time
             async with self.run_lock:
                 poll_count += 1
                 logger.info(f"=== Discord Poll cycle #{poll_count} ===")
 
                 try:
-                    # Ensure browser is launched and logged in
                     await self._ensure_browser_and_login()
 
-                    # Process each channel
                     for channel_id in self.channels:
                         now = time.time()
                         if now - self._last_poll.get(channel_id, 0) < 10:
@@ -783,7 +744,6 @@ class DiscordScraper:
                                 self._page = await self.context.new_page()
                                 continue
 
-                            # Scroll to bottom
                             try:
                                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                             except Exception:
@@ -820,10 +780,8 @@ class DiscordScraper:
                     logger.exception(f"Error in poll cycle: {e}")
 
                 finally:
-                    # Close browser to free memory – critical!
                     await self._close_browser()
 
-            # Sleep outside the lock so other scrapers can run
             await asyncio.sleep(random.uniform(60, 120))
 
     async def stop(self):
