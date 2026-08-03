@@ -137,20 +137,10 @@ _EXTRACT_JS = r"""
 """
 
 # JavaScript to inject a Discord auth token directly into localStorage
-# This bypasses the login form entirely
 _INJECT_TOKEN_JS = """
 (token) => {
     // Store token in localStorage the same way Discord's app does
     window.localStorage.setItem('token', JSON.stringify(token));
-    
-    // Also try the Redux store injection approach
-    try {
-        const iframe = document.createElement('iframe');
-        document.body.appendChild(iframe);
-        iframe.contentWindow.localStorage.setItem('token', JSON.stringify(token));
-        document.body.removeChild(iframe);
-    } catch(e) {}
-    
     return true;
 }
 """
@@ -224,9 +214,9 @@ class DiscordScraper:
         import os
         self._discord_token: str | None = os.environ.get("DISCORD_TOKEN", "").strip() or None
         if self._discord_token:
-            logger.info("✓ DISCORD_TOKEN found – will use token injection (no browser login needed)")
+            logger.info("✓ DISCORD_TOKEN found – will use token injection")
         else:
-            logger.info("No DISCORD_TOKEN – will use email/password browser login")
+            logger.info("No DISCORD_TOKEN – will use email/password login")
 
     # ------------------------------------------------------------------
     # Browser args / context
@@ -242,7 +232,6 @@ class DiscordScraper:
             "--disable-setuid-sandbox",
             "--window-size=1280,720",
             "--disable-automation",
-            # Memory saving flags for 512MB servers
             "--js-flags=--max-old-space-size=256",
             "--renderer-process-limit=1",
             "--disable-extensions",
@@ -277,122 +266,136 @@ class DiscordScraper:
         )
 
     # ------------------------------------------------------------------
-    # Token injection login (PRIMARY method – no CAPTCHA, no OOM)
+    # Token injection login (fixed: wait for localStorage)
     # ------------------------------------------------------------------
     async def _login_with_token(self, page: Page) -> bool:
-        """
-        Inject the Discord auth token directly into localStorage.
-        This is the most reliable method on headless servers.
-        Returns True if successful.
-        """
         if not self._discord_token:
             return False
 
-        logger.info("Injecting Discord auth token into browser...")
+        logger.info("Injecting Discord auth token...")
+        clean_token = self._discord_token.strip().strip('"').strip("'")
 
         try:
-            # Navigate to Discord first (need a page context to set localStorage)
+            # Navigate to /login to establish storage context
             await page.goto(
                 "https://discord.com/login",
                 wait_until="domcontentloaded",
-                timeout=20000,
+                timeout=25000,
             )
-            await asyncio.sleep(2)
 
-            # Inject token into localStorage
-            await page.evaluate(_INJECT_TOKEN_JS, self._discord_token)
-            logger.info("Token injected into localStorage")
+            # Wait for localStorage to be available
+            for tick in range(15):
+                await asyncio.sleep(1)
+                try:
+                    ls_available = await page.evaluate(
+                        "() => typeof window.localStorage !== 'undefined' "
+                        "       && window.localStorage !== null"
+                    )
+                    if ls_available:
+                        logger.info(f"localStorage ready after {tick+1}s")
+                        break
+                except Exception:
+                    pass
+            else:
+                logger.error("localStorage never became available")
+                await self._save_debug_snapshot(page, "localstorage_unavailable")
+                return False
 
-            # Navigate to the app – Discord will pick up the token
+            # Inject token
+            result = await page.evaluate("""
+                (token) => {
+                    try {
+                        window.localStorage.setItem('token', JSON.stringify(token));
+                        return { ok: true, stored: window.localStorage.getItem('token') };
+                    } catch(e) {
+                        return { ok: false, error: e.toString() };
+                    }
+                }
+            """, clean_token)
+
+            if not result or not result.get("ok"):
+                logger.error(f"localStorage.setItem failed: {result}")
+                return False
+
+            logger.info("Token stored – reloading Discord...")
+
+            # Navigate to the main app
             await page.goto(
                 "https://discord.com/channels/@me",
                 wait_until="domcontentloaded",
-                timeout=20000,
+                timeout=25000,
             )
-            await asyncio.sleep(3)
 
-            # Verify login worked
-            if await self._chat_is_visible(page) or await self._sidebar_is_visible(page):
-                logger.info("✓ Token injection successful – logged in")
-                return True
+            # Wait for authentication
+            for tick in range(15):
+                await asyncio.sleep(2)
 
-            # Try one more time with a direct channel URL
-            await asyncio.sleep(2)
-            if await self._chat_is_visible(page) or await self._sidebar_is_visible(page):
-                logger.info("✓ Token injection confirmed on retry")
-                return True
+                if await self._chat_is_visible(page) or await self._sidebar_is_visible(page):
+                    logger.info(f"✓ Token login OK after {(tick+1)*2}s")
+                    return True
 
-            logger.warning("Token injection did not result in login – token may be expired")
-            await self._save_debug_snapshot(page, "token_injection_failed")
+                if "/login" in page.url:
+                    logger.warning("Discord redirected to /login – token invalid/expired")
+                    await self._save_debug_snapshot(page, "token_rejected")
+                    return False
+
+            await self._save_debug_snapshot(page, "token_login_timeout")
             return False
 
         except Exception as e:
-            logger.error(f"Token injection failed: {e}")
+            logger.error(f"Token injection error: {e}", exc_info=True)
+            await self._save_debug_snapshot(page, "token_injection_exception")
             return False
 
     # ------------------------------------------------------------------
-    # Email/password login (FALLBACK – may hit CAPTCHA on fresh browsers)
+    # Email/password login (fallback)
     # ------------------------------------------------------------------
     async def _login_with_email(self, page: Page) -> bool:
-        """
-        Fill the Discord login form with email/password.
-        Returns True if login succeeded.
-        """
         if not self.email or not self.password:
-            logger.error("No email/password configured for login")
             return False
 
         logger.info("→ Attempting email/password login...")
 
-        # Navigate to login page
-        for attempt in range(1, 4):
+        for attempt in range(3):
             try:
                 await page.goto(
                     "https://discord.com/login",
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
-                logger.info(f"Login page loaded (attempt {attempt})")
+                logger.info(f"Login page loaded (attempt {attempt+1})")
                 break
             except Exception as e:
-                logger.warning(f"Login page navigation attempt {attempt} failed: {e}")
-                if attempt == 3:
+                logger.warning(f"Login page attempt {attempt+1} failed: {e}")
+                if attempt == 2:
                     return False
                 await asyncio.sleep(3)
 
-        # Wait for email input (up to 40 s)
+        # Wait for email input
         email_selector = None
-        for tick in range(20):
+        for tick in range(15):
             await asyncio.sleep(2)
 
             if await self._chat_is_visible(page) or await self._sidebar_is_visible(page):
-                logger.info("✓ Already logged in during email login attempt")
+                logger.info("✓ Already logged in")
                 return True
 
             for sel in [
-                'input[name="email"]',
-                'input[type="email"]',
-                'input[autocomplete="email"]',
-                'input[autocomplete="username"]',
+                'input[name="email"]', 'input[type="email"]',
+                'input[autocomplete="email"]', 'input[autocomplete="username"]',
             ]:
-                el = await page.query_selector(sel)
-                if el:
+                if await page.query_selector(sel):
                     email_selector = sel
-                    logger.info(f"Email input found: '{sel}' after {(tick+1)*2}s")
+                    logger.info(f"Email input found after {(tick+1)*2}s")
                     break
-
             if email_selector:
                 break
-            logger.debug(f"Waiting for login form tick {tick+1}/20 | URL: {page.url}")
 
         if not email_selector:
             await self._save_debug_snapshot(page, "email_form_not_found")
-            logger.error("Login form never appeared")
             return False
 
         # Fill email
-        await page.click(email_selector)
-        await asyncio.sleep(0.2)
         await page.click(email_selector, click_count=3)
         await page.keyboard.type(self.email, delay=40)
         await asyncio.sleep(0.3)
@@ -400,18 +403,13 @@ class DiscordScraper:
         # Fill password
         pwd_selector = None
         for sel in ['input[name="password"]', 'input[type="password"]']:
-            el = await page.query_selector(sel)
-            if el:
+            if await page.query_selector(sel):
                 pwd_selector = sel
                 break
-
         if not pwd_selector:
             await self._save_debug_snapshot(page, "password_field_missing")
-            logger.error("Password field not found")
             return False
 
-        await page.click(pwd_selector)
-        await asyncio.sleep(0.2)
         await page.click(pwd_selector, click_count=3)
         await page.keyboard.type(self.password, delay=40)
         await asyncio.sleep(0.4)
@@ -419,124 +417,80 @@ class DiscordScraper:
         # Submit
         submit = await page.query_selector('button[type="submit"]')
         if submit:
-            logger.info("Clicking submit...")
             await submit.click()
         else:
-            logger.warning("No submit button – pressing Enter")
             await page.keyboard.press("Enter")
 
-        logger.info("Form submitted – waiting for response...")
-
-        # Wait for login result (up to 60 s)
+        # Wait for result
         for tick in range(30):
             await asyncio.sleep(2)
 
             if await self._chat_is_visible(page):
-                logger.info(f"✓ Logged in via email – chat visible after {(tick+1)*2}s")
+                logger.info(f"✓ Logged in via email after {(tick+1)*2}s")
+                await self._extract_and_cache_token(page)
                 return True
 
             if await self._sidebar_is_visible(page):
-                logger.info(f"✓ Logged in via email – sidebar visible after {(tick+1)*2}s")
+                logger.info(f"✓ Logged in via email (sidebar) after {(tick+1)*2}s")
+                await self._extract_and_cache_token(page)
                 return True
 
             # 2FA
-            for twofa_sel in [
-                'input[name="code"]',
-                'input[placeholder*="6-digit"]',
-                'input[placeholder*="authentication"]',
-            ]:
-                twofa = await page.query_selector(twofa_sel)
-                if twofa:
-                    logger.info("2FA prompt detected – attempting auto-fill")
-                    filled = await self._handle_2fa(page, twofa_sel)
+            for sel in ['input[name="code"]', 'input[placeholder*="6-digit"]']:
+                if await page.query_selector(sel):
+                    logger.warning("2FA required – auto-filling...")
+                    filled = await self._handle_2fa(page, sel)
                     if not filled:
-                        logger.error(
-                            "2FA required but DISCORD_TOTP_SECRET not set. "
-                            "Set env var or disable 2FA on the account."
-                        )
                         return False
-                    # Wait for 2FA to complete
                     for _ in range(20):
                         await asyncio.sleep(2)
                         if await self._chat_is_visible(page) or await self._sidebar_is_visible(page):
                             logger.info("✓ 2FA completed")
                             return True
 
-            # Error messages
             for err_sel in ['[class*="errorMessage"]', '[class*="error-message"]']:
-                err_el = await page.query_selector(err_sel)
-                if err_el:
-                    err_text = (await err_el.text_content() or "").strip()
+                err = await page.query_selector(err_sel)
+                if err:
+                    err_text = (await err.text_content() or "").strip()
                     if err_text:
-                        logger.error(f"Discord login error: {err_text}")
+                        logger.error(f"Login error: {err_text}")
                         return False
 
-            logger.debug(f"Awaiting login tick {tick+1}/30 | URL: {page.url}")
-
         await self._save_debug_snapshot(page, "email_login_timeout")
-        logger.error("Email login timed out after 60s")
         return False
 
     # ------------------------------------------------------------------
-    # Master login orchestrator
+    # Master login
     # ------------------------------------------------------------------
-    async def _perform_login(self, page: Page) -> None:
-        """
-        Try token injection first, fall back to email/password.
-        Raises RuntimeError if all methods fail.
-        """
-        # Method 1: Token injection (fast, reliable, no CAPTCHA)
+    async def _perform_login(self, page: Page) -> bool:
         if self._discord_token:
-            success = await self._login_with_token(page)
-            if success:
-                return
-            logger.warning("Token login failed – falling back to email/password")
+            if await self._login_with_token(page):
+                return True
+            logger.warning("Token login failed – falling back to email")
 
-        # Method 2: Email/password form fill
-        success = await self._login_with_email(page)
-        if success:
-            # If login succeeded via email, try to extract and cache the token
-            await self._extract_and_cache_token(page)
-            return
-
-        raise RuntimeError(
-            "All login methods failed. "
-            "Set DISCORD_TOKEN env var with a valid token, "
-            "or check email/password credentials."
-        )
+        return await self._login_with_email(page)
 
     async def _extract_and_cache_token(self, page: Page) -> None:
-        """
-        After email login, extract the token from localStorage and log it
-        so the operator can set DISCORD_TOKEN for future deploys.
-        """
         try:
             token = await page.evaluate(
                 "() => window.localStorage.getItem('token')"
             )
             if token:
-                # Strip surrounding quotes if present
                 token = token.strip('"').strip("'")
                 self._discord_token = token
-                logger.info(
-                    f"✓ Token extracted after login. "
-                    f"Set DISCORD_TOKEN={token} in your environment "
-                    f"to skip login next time."
-                )
-        except Exception as e:
-            logger.debug(f"Could not extract token: {e}")
+                logger.info(f"✓ Token extracted: {token[:20]}...")
+        except Exception:
+            pass
 
-    # ------------------------------------------------------------------
-    # 2FA handler
-    # ------------------------------------------------------------------
     async def _handle_2fa(self, page: Page, input_selector: str) -> bool:
         import os
-        totp_secret = os.environ.get("DISCORD_TOTP_SECRET", "").strip()
-        if not totp_secret:
+        secret = os.environ.get("DISCORD_TOTP_SECRET", "").strip()
+        if not secret:
+            logger.error("DISCORD_TOTP_SECRET not set")
             return False
         try:
             import pyotp
-            code = pyotp.TOTP(totp_secret).now()
+            code = pyotp.TOTP(secret).now()
             logger.info(f"Auto-filling TOTP: {code}")
             await page.click(input_selector, click_count=3)
             await page.keyboard.type(code, delay=30)
@@ -577,11 +531,6 @@ class DiscordScraper:
         except Exception:
             return False
 
-    async def _is_logged_in(self, page: Page) -> bool:
-        if "/login" in page.url:
-            return False
-        return await self._chat_is_visible(page) or await self._sidebar_is_visible(page)
-
     # ------------------------------------------------------------------
     # Debug snapshot
     # ------------------------------------------------------------------
@@ -596,11 +545,36 @@ class DiscordScraper:
             html = await page.content()
             base.with_suffix(".html").write_text(html, encoding="utf-8")
             logger.error(f"Debug snapshot → {base}.png | URL: {page.url}")
-        except Exception as e:
-            logger.warning(f"Could not save snapshot '{label}': {e}")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
-    # Ensure browser and login
+    # Memory logging
+    # ------------------------------------------------------------------
+    async def _log_memory(self, label: str = "") -> int:
+        try:
+            proc = psutil.Process()
+            mem_mb = proc.memory_info().rss / 1024 / 1024
+            label_str = f" [{label}]" if label else ""
+            logger.info(f"[MEM{label_str}] {mem_mb:.1f} MB")
+            return int(mem_mb)
+        except Exception:
+            return 0
+
+    # ------------------------------------------------------------------
+    # Browser health check (keep alive)
+    # ------------------------------------------------------------------
+    async def _browser_healthy(self) -> bool:
+        if self.context is None or self._page is None:
+            return False
+        try:
+            await self._page.evaluate("1", timeout=3000)
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Ensure browser and login (launch once)
     # ------------------------------------------------------------------
     async def _ensure_browser_and_login(self):
         if self._browser_ready and self.context is not None:
@@ -608,14 +582,13 @@ class DiscordScraper:
 
         logger.info("Launching browser...")
 
-        # Remove stale lock
         lock_file = self.user_data_dir / "SingletonLock"
         if lock_file.exists():
             logger.warning("Removing stale SingletonLock")
             try:
                 lock_file.unlink()
-            except Exception as e:
-                logger.warning(f"Could not remove lock: {e}")
+            except Exception:
+                pass
 
         self._playwright = await async_playwright().start()
 
@@ -629,7 +602,6 @@ class DiscordScraper:
 
         self._page = await self.context.new_page()
 
-        # Check if already logged in via persistent session
         test_channel = self.channels[0] if self.channels else None
         guild_id = (
             self._channel_guilds.get(test_channel, self.GUILD_ID)
@@ -644,9 +616,8 @@ class DiscordScraper:
 
         try:
             await self._page.goto(test_url, wait_until="domcontentloaded", timeout=25000)
-        except Exception as e:
-            logger.warning(f"Initial nav error (non-fatal): {e}")
-
+        except Exception:
+            pass
         await asyncio.sleep(3)
 
         if await self._chat_is_visible(self._page):
@@ -654,11 +625,12 @@ class DiscordScraper:
             self._browser_ready = True
             return
 
-        # Must login
         logger.info("No valid session – logging in")
-        await self._perform_login(self._page)
+        success = await self._perform_login(self._page)
+        if not success:
+            await self._save_debug_snapshot(self._page, "login_failed")
+            raise RuntimeError("Login failed")
 
-        # Navigate to channel after login
         if test_channel:
             try:
                 await self._page.goto(
@@ -666,41 +638,44 @@ class DiscordScraper:
                     wait_until="domcontentloaded",
                     timeout=25000,
                 )
-            except Exception as e:
-                logger.warning(f"Post-login nav error (non-fatal): {e}")
+            except Exception:
+                pass
             await asyncio.sleep(4)
 
         if not (await self._chat_is_visible(self._page) or await self._sidebar_is_visible(self._page)):
-            await self._save_debug_snapshot(self._page, "post_login_failed")
-            raise RuntimeError(
-                f"Login failed – nothing visible after login. URL: {self._page.url}"
-            )
+            raise RuntimeError("Login succeeded but no chat/sidebar visible")
 
         logger.info("✓ Login complete")
         self._browser_ready = True
 
     # ------------------------------------------------------------------
-    # Browser close
+    # Browser close (only when stopping)
     # ------------------------------------------------------------------
     async def _close_browser(self):
         if self.context is not None:
             try:
-                if self._page:
+                if self._page and not self._page.is_closed():
                     await self._page.close()
+            except Exception:
+                pass
+            try:
                 await self.context.close()
-            except Exception as e:
-                logger.warning(f"Browser close error: {e}")
+            except Exception:
+                pass
             self.context = None
             self._page = None
             self._browser_ready = False
-            if self._playwright:
-                try:
-                    await self._playwright.stop()
-                except Exception:
-                    pass
-                self._playwright = None
-            gc.collect()
-            logger.info("Browser closed")
+
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+        gc.collect()
+        await asyncio.sleep(2)
+        logger.info("Browser closed and memory freed")
 
     # ------------------------------------------------------------------
     # Navigation
@@ -728,9 +703,8 @@ class DiscordScraper:
 
         try:
             await page.goto(target, wait_until="domcontentloaded", timeout=25000)
-        except Exception as e:
-            logger.warning(f"Nav error (non-fatal): {e}")
-
+        except Exception:
+            pass
         await asyncio.sleep(2)
 
         if not await self._chat_is_visible(page):
@@ -738,8 +712,8 @@ class DiscordScraper:
             await self._perform_login(page)
             try:
                 await page.goto(target, wait_until="domcontentloaded", timeout=25000)
-            except Exception as e:
-                logger.warning(f"Post-relogin nav error: {e}")
+            except Exception:
+                pass
             await asyncio.sleep(2)
 
         await self._wait_for_chat(page)
@@ -781,7 +755,7 @@ class DiscordScraper:
                 continue
 
     # ------------------------------------------------------------------
-    # Message loading  (reduced max_scrolls to save memory)
+    # Message loading (reduced scrolls)
     # ------------------------------------------------------------------
     async def _find_scroller(self, page: Page):
         for sel in [
@@ -899,10 +873,8 @@ class DiscordScraper:
         initial_load = not self._initial_load_done.get(channel_id, False)
         last_id = self._last_processed.get(channel_id, 0)
 
-        # CRITICAL: limit scrolls to prevent OOM
-        # Initial load: 100 scrolls max (not 500!)
-        # Subsequent: 20 scrolls
-        max_scrolls = 100 if initial_load else 20
+        # Memory: initial 30 scrolls, subsequent 10
+        max_scrolls = 30 if initial_load else 10
 
         all_msgs = await self._load_messages(page, max_scrolls=max_scrolls)
 
@@ -1020,7 +992,7 @@ class DiscordScraper:
                 self._track(channel_id, "failed")
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API – BROWSER STAYS OPEN
     # ------------------------------------------------------------------
     async def start(self) -> None:
         self._running = True
@@ -1031,15 +1003,30 @@ class DiscordScraper:
             raise RuntimeError("Call start() first")
 
         logger.info(f"[POLL] Starting for {len(self.channels)} channel(s)")
+
+        # Launch browser ONCE
+        try:
+            await self._ensure_browser_and_login()
+            await self._log_memory("after-launch")
+        except Exception as e:
+            logger.exception(f"Fatal: could not launch browser or login: {e}")
+            return
+
         poll_count = 0
-
         while self._running:
-            async with self.run_lock:
-                poll_count += 1
-                logger.info(f"=== Poll #{poll_count} ===")
+            poll_count += 1
+            logger.info(f"=== Poll #{poll_count} ===")
 
+            async with self.run_lock:
                 try:
-                    await self._ensure_browser_and_login()
+                    # Check browser health
+                    if not await self._browser_healthy():
+                        logger.warning("Browser died – relaunching")
+                        await self._close_browser()
+                        await asyncio.sleep(5)
+                        await self._ensure_browser_and_login()
+
+                    await self._log_memory("poll-start")
 
                     for channel_id in self.channels:
                         now = time.time()
@@ -1050,6 +1037,7 @@ class DiscordScraper:
                         try:
                             page = await self._navigate_to_channel(channel_id)
                             if not await self._page_alive(page):
+                                logger.warning(f"Page dead – skipping {channel_id}")
                                 self._page = await self.context.new_page()
                                 continue
 
@@ -1084,15 +1072,18 @@ class DiscordScraper:
 
                         await asyncio.sleep(random.uniform(1, 3))
 
+                    await self._log_memory("after-messages")
+
                 except Exception as e:
                     logger.exception(f"Poll cycle error: {e}")
-                finally:
-                    await self._close_browser()
 
-            # Wait between cycles – longer to reduce memory pressure
-            wait = random.uniform(90, 150)
-            logger.info(f"Next poll in {wait:.0f}s")
+            # Wait between polls – browser stays open
+            wait = random.uniform(60, 90)
+            logger.info(f"Sleeping {wait:.0f}s until next poll")
             await asyncio.sleep(wait)
+
+        # Loop exited – close browser
+        await self._close_browser()
 
     async def stop(self) -> None:
         self._running = False
