@@ -164,7 +164,7 @@ class DiscordScraper:
         email: str,
         password: str | None,
         channels: list[str],
-        transformer: MediaTransformer,                          # <-- kept for compatibility
+        transformer: MediaTransformer,
         on_message_callback: Callable[[Any, SourceInfo], Coroutine[Any, Any, bool]],
         data_dir: Path,
         headless: bool = False,
@@ -172,7 +172,7 @@ class DiscordScraper:
         store: Optional[Store] = None,
         run_lock: Optional[asyncio.Lock] = None,
         channel_guilds: Optional[dict[str, str]] = None,
-        debug_dir: Optional[Path] = None,                      # <-- new parameter
+        debug_dir: Optional[Path] = None,
     ):
         self.email = email
         self.password = password
@@ -184,7 +184,7 @@ class DiscordScraper:
         self.store = store
         self.run_lock = run_lock or asyncio.Lock()
         self._channel_guilds: dict[str, str] = dict(channel_guilds or {})
-        self.debug_dir = debug_dir or data_dir                  # <-- use provided or default
+        self.debug_dir = debug_dir or data_dir
 
         self.start_date: datetime | None = None
         if start_date:
@@ -213,7 +213,7 @@ class DiscordScraper:
         self._last_processed: dict[str, int] = {}
 
     # ------------------------------------------------------------------
-    # Browser lifecycle (deferred)
+    # Browser lifecycle
     # ------------------------------------------------------------------
     def _get_browser_args(self) -> list[str]:
         return [
@@ -252,39 +252,34 @@ class DiscordScraper:
         self.context = await self._create_browser_context(self._playwright)
         self._page = await self.context.new_page()
 
-        # Test login on the first channel's guild (if possible)
+        # Determine test URL using the first channel's guild
         test_channel = self.channels[0] if self.channels else None
         if test_channel and test_channel in self._channel_guilds:
             guild_id = self._channel_guilds[test_channel]
-            test_url = f"https://discord.com/channels/{guild_id}/{test_channel}"
         else:
             guild_id = self.GUILD_ID
-            test_url = f"https://discord.com/channels/{guild_id}/{test_channel}" if test_channel else "https://discord.com/channels/@me"
-
+        test_url = f"https://discord.com/channels/{guild_id}/{test_channel}" if test_channel else "https://discord.com/channels/@me"
         logger.info(f"Test URL: {test_url}")
-        await self._page.goto(test_url, wait_until="networkidle")
+
+        # Navigate and wait for the page to load
+        await self._page.goto(test_url, wait_until="networkidle", timeout=30000)
         await asyncio.sleep(2)
 
+        # Check if we are already logged in
         if await self._is_logged_in(self._page):
             logger.info("✓ Using existing Discord session")
             self._browser_ready = True
             return
 
-        logger.warning("Session invalid – re-logging in")
-        await self._page.close()
-        await self.context.close()
-        shutil.rmtree(self.user_data_dir, ignore_errors=True)
-        self.user_data_dir.mkdir(exist_ok=True)
-
-        self.context = await self._create_browser_context(self._playwright)
-        self._page = await self.context.new_page()
+        # If not logged in, perform login
+        logger.info("Not logged in – performing login...")
         await self._perform_login(self._page)
 
-        if test_channel:
-            await self._page.goto(test_url, wait_until="networkidle")
-            await asyncio.sleep(2)
-            if not await self._is_logged_in(self._page):
-                raise RuntimeError("Login seemed successful but cannot access channels")
+        # After login, verify that we are on a channels page
+        await self._page.wait_for_load_state("networkidle", timeout=10000)
+        await asyncio.sleep(2)
+        if not await self._is_logged_in(self._page):
+            raise RuntimeError("Login failed – still not logged in")
 
         logger.info("✓ Login confirmed – ready to poll")
         self._browser_ready = True
@@ -310,25 +305,25 @@ class DiscordScraper:
             logger.info("Discord browser closed")
 
     # ------------------------------------------------------------------
-    # Login helpers
+    # Login helpers (UPDATED)
     # ------------------------------------------------------------------
     async def _is_logged_in(self, page: Page) -> bool:
         try:
-            url = page.url
-            if "/login" in url or "/register" in url or "/download" in url:
+            # Wait for the page to settle
+            await page.wait_for_load_state("networkidle", timeout=5000)
+            # If URL contains login, definitely not logged in
+            if "/login" in page.url:
                 return False
-            if await page.locator('input[name="email"]').count() > 0:
+            # Check for login form inputs (if present, not logged in)
+            email_input = await page.query_selector('input[name="email"]')
+            if email_input:
                 return False
-            for sel in [
-                'div[class*="sidebar"]', 'nav[aria-label="Servers"]',
-                'div[class*="guilds"]', 'div[class*="app-"]',
-            ]:
-                try:
-                    if await page.locator(sel).count() > 0:
-                        return True
-                except Exception:
-                    continue
-            return "/channels/" in url
+            # Check for sidebar or guilds list
+            sidebar = await page.query_selector('div[class*="sidebar"], nav[aria-label="Servers"]')
+            if sidebar:
+                return True
+            # Fallback: if URL has /channels/ and no login form, assume logged in
+            return "/channels/" in page.url
         except Exception:
             return False
 
@@ -341,11 +336,13 @@ class DiscordScraper:
         await asyncio.sleep(0.5)
         await page.click('button[type="submit"]')
         logger.info("Login form submitted")
+        # Wait for the login to complete
         for _ in range(24):
             await asyncio.sleep(5)
             if await self._is_logged_in(page):
                 logger.info("✓ Login successful")
                 return
+            # If we see a 2FA input, warn
             if await page.locator('input[name="code"]').count() > 0:
                 logger.warning("⚠ 2FA required – enter code in browser")
         raise RuntimeError("Login failed after 2 minutes")
@@ -426,7 +423,7 @@ class DiscordScraper:
                 continue
 
     # ------------------------------------------------------------------
-    # Message loading
+    # Message loading (unchanged from last update with debug_dir etc.)
     # ------------------------------------------------------------------
     async def _find_scroller(self, page: Page):
         # Try a wider set of selectors that match current Discord
@@ -443,14 +440,12 @@ class DiscordScraper:
             try:
                 el = await page.query_selector(sel)
                 if el:
-                    # Check if the element itself is scrollable
                     scrollable = await el.evaluate(
                         "e => e.scrollHeight > e.clientHeight + 5"
                     )
                     if scrollable:
                         logger.info(f"Scroller found using selector: {sel}")
                         return el
-                    # If not, check its parent
                     parent = await el.evaluate_handle("e => e.parentElement")
                     if parent:
                         parent_scrollable = await parent.evaluate(
@@ -462,7 +457,6 @@ class DiscordScraper:
             except Exception:
                 continue
 
-        # Fallback: find any scrollable div
         el = await page.evaluate_handle("""
             () => {
                 let best = null, bestH = 0;
@@ -542,7 +536,6 @@ class DiscordScraper:
                 logger.warning(f"JS extraction error at scroll {i}: {e}")
                 message_data = []
 
-            # Debug: save HTML and screenshot if no messages extracted
             if not message_data and self.debug_dir:
                 self.debug_dir.mkdir(parents=True, exist_ok=True)
                 html = await page.content()
