@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import aiohttp
 from dotenv import load_dotenv
+from aiohttp import web
 
 from discord_scraper import DiscordScraper
 from models import SourceInfo
@@ -95,6 +96,20 @@ class DummyTransformer:
     async def transform_video(self, path):
         return {"video": path, "thumbnail": None}
 
+# --- Health check endpoint ---
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    port = int(os.environ.get('PORT', 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"Health check server running on port {port}")
+
 # --- Main loop with dynamic refresh ---
 async def main():
     # Initial fetch
@@ -116,6 +131,10 @@ async def main():
     )
 
     await scraper.start()
+
+    # Start health check HTTP server (keeps Render alive)
+    await start_http_server()
+
     poll_task = asyncio.create_task(scraper.poll_channels())
 
     # Background task: refresh sources every 60 seconds
@@ -126,23 +145,20 @@ async def main():
             new_channels = await fetch_discord_sources()
             if new_channels is not None and set(new_channels) != set(channels):
                 logger.info(f"Channel list changed: {new_channels}")
-                # Stop current poll loop
                 poll_task.cancel()
                 try:
                     await poll_task
                 except asyncio.CancelledError:
                     pass
-                # Update scraper's channels
                 scraper.channels = new_channels
                 scraper._known_message_ids.clear()
                 scraper._initial_load_done.clear()
-                # Restart poll
                 channels = new_channels
                 poll_task = asyncio.create_task(scraper.poll_channels())
 
     refresh_task = asyncio.create_task(refresh_loop())
 
-    # Wait for poll task (will run until cancelled)
+    # Keep running until cancelled
     try:
         await poll_task
     except asyncio.CancelledError:
