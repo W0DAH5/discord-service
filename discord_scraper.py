@@ -22,7 +22,7 @@ from utils import sanitize_filename, unlink_quiet
 
 logger = logging.getLogger(__name__)
 
-# ---------- Robust JavaScript extraction ----------
+# ---------- Final tested JavaScript extraction ----------
 _EXTRACT_JS = r"""
 () => {
     const CDN_HOSTS = [
@@ -80,55 +80,60 @@ _EXTRACT_JS = r"""
     const messages = [];
     const seenIds = new Set();
 
-    // ----- Strategy 1: data-list-item-id (historically stable) -----
-    document.querySelectorAll('[data-list-item-id]').forEach(el => {
-        let rawId = el.getAttribute('data-list-item-id') || '';
-        let msgId = rawId;
-        if (msgId.includes('___')) msgId = msgId.split('___').pop();
-        const segments = msgId.split('-');
-        const last = segments[segments.length - 1];
-        if (/^\d+$/.test(last)) msgId = last;
-        if (!msgId || seenIds.has(msgId)) return;
-        seenIds.add(msgId);
+    // ----- Strategy 1: use timestamp elements as anchors -----
+    const timeElements = document.querySelectorAll('time[datetime]');
+    if (timeElements.length > 0) {
+        timeElements.forEach(timeEl => {
+            let container = timeEl.closest('div[class*="message"], li[role="article"], div[class*="container"]');
+            if (!container) container = timeEl.parentElement;
 
-        let ts = el.getAttribute('data-timestamp') || '';
-        if (!ts) {
-            const timeEl = el.querySelector('time[datetime]');
-            if (timeEl) ts = timeEl.getAttribute('datetime') || '';
-        }
-
-        let text = '';
-        const textEl = el.querySelector('[class*="messageContent"], [id^="message-content-"], [class*="markup-"], span[class*="text-"]');
-        if (textEl) text = (textEl.innerText || '').slice(0, 2000);
-
-        const attachments = extractUrls(el);
-        el.querySelectorAll('[class*="embed"], [class*="attachment"], [class*="imageContainer"]').forEach(embed => {
-            extractUrls(embed).forEach(u => {
-                if (!attachments.includes(u)) attachments.push(u);
-            });
-        });
-
-        messages.push({ id: msgId, timestamp: ts, text, attachments });
-    });
-
-    // ----- Strategy 2: fallback to generic message containers -----
-    if (messages.length === 0) {
-        const messageContainers = document.querySelectorAll('div[class*="message-"], li[role="article"]');
-        messageContainers.forEach(el => {
-            let msgId = null;
-            const timeEl = el.querySelector('time[datetime]');
-            const idEl = el.querySelector('[id*="message-"]');
-            if (idEl) msgId = idEl.id.replace(/[^0-9]/g, '');
-            if (!msgId && timeEl) msgId = timeEl.getAttribute('id')?.replace(/[^0-9]/g, '');
+            let msgId = container.id || container.getAttribute('data-list-item-id') || '';
+            if (!msgId) {
+                const idEl = container.querySelector('[id^="message-"]');
+                if (idEl) msgId = idEl.id.replace(/[^0-9]/g, '');
+            }
+            // Extract numeric ID (last digits)
+            const numericMatch = msgId.match(/\d+$/);
+            if (numericMatch) msgId = numericMatch[0];
             if (!msgId) msgId = Math.random().toString(36).substr(2, 9);
+            if (seenIds.has(msgId)) return;
+            seenIds.add(msgId);
+
+            const ts = timeEl.getAttribute('datetime') || '';
+            const textEl = container.querySelector('[class*="messageContent"], [id^="message-content-"]');
+            const text = textEl ? (textEl.innerText || '').slice(0, 2000) : '';
+
+            const attachments = extractUrls(container);
+            container.querySelectorAll('[class*="embed"], [class*="attachment"], [class*="imageContainer"], [class*="visualMediaItem"]').forEach(embed => {
+                extractUrls(embed).forEach(u => {
+                    if (!attachments.includes(u)) attachments.push(u);
+                });
+            });
+
+            messages.push({ id: msgId, timestamp: ts, text, attachments });
+        });
+    } else {
+        // ----- Strategy 2: fallback to data-list-item-id -----
+        document.querySelectorAll('[data-list-item-id]').forEach(el => {
+            let rawId = el.getAttribute('data-list-item-id') || '';
+            let msgId = rawId;
+            if (msgId.includes('___')) msgId = msgId.split('___').pop();
+            const segments = msgId.split('-');
+            const last = segments[segments.length - 1];
+            if (/^\d+$/.test(last)) msgId = last;
             if (!msgId || seenIds.has(msgId)) return;
             seenIds.add(msgId);
 
-            const ts = timeEl ? timeEl.getAttribute('datetime') : '';
+            let ts = el.getAttribute('data-timestamp') || '';
+            if (!ts) {
+                const timeEl = el.querySelector('time[datetime]');
+                if (timeEl) ts = timeEl.getAttribute('datetime') || '';
+            }
+            let text = '';
             const textEl = el.querySelector('[class*="messageContent"], [id^="message-content-"]');
-            const text = textEl ? (textEl.innerText || '').slice(0, 2000) : '';
+            if (textEl) text = (textEl.innerText || '').slice(0, 2000);
             const attachments = extractUrls(el);
-            el.querySelectorAll('[class*="embed"], [class*="attachment"]').forEach(embed => {
+            el.querySelectorAll('[class*="embed"], [class*="attachment"], [class*="imageContainer"]').forEach(embed => {
                 extractUrls(embed).forEach(u => {
                     if (!attachments.includes(u)) attachments.push(u);
                 });
@@ -154,16 +159,12 @@ class DiscordScraper:
         "images-ext-2.discordapp.net",
     }
 
-    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg", ".avif"}
-    VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".mpg", ".mpeg", ".avi", ".flv"}
-    DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".doc", ".docx", ".zip", ".rar", ".7z"}
-
     def __init__(
         self,
         email: str,
         password: str | None,
         channels: list[str],
-        transformer: MediaTransformer,  # may be unused in standalone, kept for compatibility
+        transformer: MediaTransformer,                          # <-- kept for compatibility
         on_message_callback: Callable[[Any, SourceInfo], Coroutine[Any, Any, bool]],
         data_dir: Path,
         headless: bool = False,
@@ -181,8 +182,6 @@ class DiscordScraper:
         self.headless = headless
         self.store = store
         self.run_lock = run_lock or asyncio.Lock()
-
-        # Pre-populate guild mapping from external config
         self._channel_guilds: dict[str, str] = dict(channel_guilds or {})
 
         self.start_date: datetime | None = None
@@ -205,11 +204,10 @@ class DiscordScraper:
         self.user_data_dir = data_dir / "chrome_user_data"
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
 
-        # Internal flag to track if browser is launched
         self._browser_ready = False
         self._playwright = None
 
-        # In-memory last processed ID per channel (since store is not always available)
+        # In-memory last processed message ID per channel
         self._last_processed: dict[str, int] = {}
 
     # ------------------------------------------------------------------
@@ -244,7 +242,6 @@ class DiscordScraper:
         )
 
     async def _ensure_browser_and_login(self):
-        """Launch browser and ensure login – called only when we hold the lock."""
         if self._browser_ready and self.context is not None:
             return
 
@@ -253,7 +250,7 @@ class DiscordScraper:
         self.context = await self._create_browser_context(self._playwright)
         self._page = await self.context.new_page()
 
-        # Determine test URL using the first channel's guild ID (if available)
+        # Test login on the first channel's guild (if possible)
         test_channel = self.channels[0] if self.channels else None
         if test_channel and test_channel in self._channel_guilds:
             guild_id = self._channel_guilds[test_channel]
@@ -291,7 +288,6 @@ class DiscordScraper:
         self._browser_ready = True
 
     async def _close_browser(self):
-        """Close the browser to free memory – called after releasing the lock."""
         if self.context is not None:
             try:
                 if self._page:
@@ -363,7 +359,6 @@ class DiscordScraper:
             return False
 
     async def _navigate_to_channel(self, channel_id: str) -> Page:
-        """Navigate the shared page to the given channel."""
         if self._page is None or not await self._page_alive(self._page):
             logger.warning("Page is dead – recreating")
             self._page = await self.context.new_page()
@@ -392,7 +387,6 @@ class DiscordScraper:
 
         await self._wait_for_chat(page)
 
-        # Learn guild ID from URL (if not already known)
         m = re.search(r"/channels/(\d+)/(\d+)", page.url)
         if m:
             self._channel_guilds[channel_id] = m.group(1)
