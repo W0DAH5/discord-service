@@ -18,7 +18,6 @@ import psutil
 from playwright.async_api import async_playwright, BrowserContext, Page
 
 from models import SourceInfo
-from transformer import MediaTransformer
 from utils import sanitize_filename, unlink_quiet
 
 # ---------- Unicode safe logging ----------
