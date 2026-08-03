@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 
+import aiohttp
 import psutil
 from playwright.async_api import async_playwright, BrowserContext, Page
 
@@ -260,82 +261,196 @@ class DiscordScraper:
         )
 
     # ------------------------------------------------------------------
-    # Token injection login
+    # API‑based login (no browser)
     # ------------------------------------------------------------------
-    async def _login_with_token(self, page: Page) -> bool:
+    async def _get_token_via_api(self) -> str | None:
+        """Authenticate with Discord's API directly using email/password."""
+        if not self.email or not self.password:
+            return None
+
+        logger.info("Authenticating via Discord API (no browser)...")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/119.0.0.0 Safari/537.36"
+            ),
+            "X-Super-Properties": (
+                "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwi"
+                "c3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96"
+                "aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJL"
+                "aXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzExOS4wLjAuMCBT"
+                "YWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTE5LjAuMC4wIiwib3Nf"
+                "dmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoi"
+                "IiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVu"
+                "dCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9u"
+                "dW1iZXIiOjI0ODcwMCwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0="
+            ),
+        }
+        payload = {
+            "login": self.email,
+            "password": self.password,
+            "undelete": False,
+            "login_source": None,
+            "gift_code_sku_id": None,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://discord.com/api/v9/auth/login",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    data = await resp.json()
+                    if resp.status == 200:
+                        token = data.get("token")
+                        if token:
+                            logger.info("✓ API login successful – token obtained")
+                            self._discord_token = token
+                            return token
+
+                    if data.get("mfa"):
+                        ticket = data.get("ticket", "")
+                        logger.warning("MFA required for API login")
+                        return await self._handle_api_mfa(session, ticket, headers)
+
+                    errors = data.get("errors") or data.get("message", "Unknown error")
+                    logger.error(f"API login failed: {errors}")
+                    return None
+
+        except aiohttp.ClientError as e:
+            logger.error(f"API login network error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"API login error: {e}")
+            return None
+
+    async def _handle_api_mfa(
+        self,
+        session: aiohttp.ClientSession,
+        ticket: str,
+        headers: dict,
+    ) -> str | None:
+        """Handle MFA during API login using TOTP secret."""
+        totp_secret = os.environ.get("DISCORD_TOTP_SECRET", "").strip()
+        if not totp_secret:
+            logger.error("MFA required but DISCORD_TOTP_SECRET not set.")
+            return None
+
+        try:
+            import pyotp
+            code = pyotp.TOTP(totp_secret).now()
+            logger.info(f"Submitting MFA code: {code}")
+
+            async with session.post(
+                "https://discord.com/api/v9/auth/mfa/totp",
+                json={"code": code, "ticket": ticket},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+                token = data.get("token")
+                if token:
+                    logger.info("✓ MFA login successful")
+                    self._discord_token = token
+                    return token
+                logger.error(f"MFA failed: {data}")
+                return None
+        except ImportError:
+            logger.error("pip install pyotp to enable MFA support")
+            return None
+        except Exception as e:
+            logger.error(f"MFA error: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Token injection into a page
+    # ------------------------------------------------------------------
+    async def _inject_token_into_page(self, page: Page) -> bool:
+        """Inject self._discord_token into the browser and navigate to Discord."""
         if not self._discord_token:
             return False
 
-        logger.info("Injecting Discord auth token...")
         clean_token = self._discord_token.strip().strip('"').strip("'")
+        logger.info("Injecting token into browser page...")
 
         try:
             await page.goto(
                 "https://discord.com/login",
-                wait_until="domcontentloaded",
-                timeout=25000,
+                wait_until="commit",
+                timeout=40000,
             )
+        except Exception as e:
+            logger.warning(f"goto discord.com/login error (continuing): {e}")
 
-            # Wait for localStorage to become available
-            for tick in range(15):
-                await asyncio.sleep(1)
-                try:
-                    ls_available = await page.evaluate(
-                        "() => typeof window.localStorage !== 'undefined' "
-                        "       && window.localStorage !== null"
-                    )
-                    if ls_available:
-                        logger.info(f"localStorage ready after {tick+1}s")
-                        break
-                except Exception:
-                    pass
-            else:
-                logger.error("localStorage never became available")
-                await self._save_debug_snapshot(page, "localstorage_unavailable")
-                return False
+        await asyncio.sleep(2)
 
-            # Inject token
-            result = await page.evaluate("""
-                (token) => {
-                    try {
-                        window.localStorage.setItem('token', JSON.stringify(token));
-                        return { ok: true, stored: window.localStorage.getItem('token') };
-                    } catch(e) {
-                        return { ok: false, error: e.toString() };
-                    }
-                }
-            """, clean_token)
+        try:
+            result = await page.evaluate(f"""
+                () => {{
+                    try {{
+                        localStorage.setItem('token', JSON.stringify('{clean_token}'));
+                        return localStorage.getItem('token');
+                    }} catch(e) {{
+                        return 'ERROR:' + e.message;
+                    }}
+                }}
+            """)
+            logger.info(f"localStorage result: {str(result)[:50]}")
+        except Exception as e:
+            logger.warning(f"localStorage set failed: {e}")
 
-            if not result or not result.get("ok"):
-                logger.error(f"localStorage.setItem failed: {result}")
-                return False
-
-            logger.info("Token stored – reloading Discord...")
+        try:
             await page.goto(
                 "https://discord.com/channels/@me",
-                wait_until="domcontentloaded",
-                timeout=25000,
+                wait_until="commit",
+                timeout=40000,
             )
-
-            for tick in range(15):
-                await asyncio.sleep(2)
-
-                if await self._chat_is_visible(page) or await self._sidebar_is_visible(page):
-                    logger.info(f"✓ Token login OK after {(tick+1)*2}s")
-                    return True
-
-                if "/login" in page.url:
-                    logger.warning("Discord redirected to /login – token invalid/expired")
-                    await self._save_debug_snapshot(page, "token_rejected")
-                    return False
-
-            await self._save_debug_snapshot(page, "token_login_timeout")
-            return False
-
         except Exception as e:
-            logger.error(f"Token injection error: {e}", exc_info=True)
-            await self._save_debug_snapshot(page, "token_injection_exception")
-            return False
+            logger.warning(f"goto channels/@me error (continuing): {e}")
+
+        await asyncio.sleep(5)
+
+        if await self._chat_is_visible(page):
+            logger.info("✓ Token injection confirmed – chat visible")
+            return True
+        if await self._sidebar_is_visible(page):
+            logger.info("✓ Token injection confirmed – sidebar visible")
+            return True
+
+        logger.warning(f"Token injection: no Discord UI after inject. URL: {page.url}")
+        return False
+
+    # ------------------------------------------------------------------
+    # Master login – API first, browser never
+    # ------------------------------------------------------------------
+    async def _perform_login(self, page: Page) -> bool:
+        # Strategy 1: Use existing token
+        if self._discord_token:
+            logger.info("Have token – injecting into browser")
+            if await self._inject_token_into_page(page):
+                return True
+            logger.warning("Token injection failed – token may be expired, trying API login")
+            self._discord_token = None
+
+        # Strategy 2: Get token via API (fast, no browser UI)
+        token = await self._get_token_via_api()
+        if token:
+            self._discord_token = token
+            if await self._inject_token_into_page(page):
+                return True
+            logger.warning("API token obtained but injection failed")
+
+        # Strategy 3: Browser form fill (last resort)
+        logger.warning("Falling back to browser form login")
+        if await self._login_with_email(page):
+            await self._extract_and_cache_token(page)
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Email/password login (fallback)
@@ -361,7 +476,6 @@ class DiscordScraper:
                     return False
                 await asyncio.sleep(3)
 
-        # Wait for email input
         email_selector = None
         for tick in range(15):
             await asyncio.sleep(2)
@@ -385,12 +499,10 @@ class DiscordScraper:
             await self._save_debug_snapshot(page, "email_form_not_found")
             return False
 
-        # Fill email
         await page.click(email_selector, click_count=3)
         await page.keyboard.type(self.email, delay=40)
         await asyncio.sleep(0.3)
 
-        # Fill password
         pwd_selector = None
         for sel in ['input[name="password"]', 'input[type="password"]']:
             if await page.query_selector(sel):
@@ -404,14 +516,12 @@ class DiscordScraper:
         await page.keyboard.type(self.password, delay=40)
         await asyncio.sleep(0.4)
 
-        # Submit
         submit = await page.query_selector('button[type="submit"]')
         if submit:
             await submit.click()
         else:
             await page.keyboard.press("Enter")
 
-        # Wait for result
         for tick in range(30):
             await asyncio.sleep(2)
 
@@ -425,12 +535,10 @@ class DiscordScraper:
                 await self._extract_and_cache_token(page)
                 return True
 
-            # 2FA
             for sel in ['input[name="code"]', 'input[placeholder*="6-digit"]']:
                 if await page.query_selector(sel):
                     logger.warning("2FA required – auto-filling...")
-                    filled = await self._handle_2fa(page, sel)
-                    if not filled:
+                    if not await self._handle_2fa(page, sel):
                         return False
                     for _ in range(20):
                         await asyncio.sleep(2)
@@ -449,22 +557,9 @@ class DiscordScraper:
         await self._save_debug_snapshot(page, "email_login_timeout")
         return False
 
-    # ------------------------------------------------------------------
-    # Master login
-    # ------------------------------------------------------------------
-    async def _perform_login(self, page: Page) -> bool:
-        if self._discord_token:
-            if await self._login_with_token(page):
-                return True
-            logger.warning("Token login failed – falling back to email")
-
-        return await self._login_with_email(page)
-
     async def _extract_and_cache_token(self, page: Page) -> None:
         try:
-            token = await page.evaluate(
-                "() => window.localStorage.getItem('token')"
-            )
+            token = await page.evaluate("() => window.localStorage.getItem('token')")
             if token:
                 token = token.strip('"').strip("'")
                 self._discord_token = token
@@ -498,7 +593,7 @@ class DiscordScraper:
             return False
 
     # ------------------------------------------------------------------
-    # DOM presence helpers
+    # DOM helpers
     # ------------------------------------------------------------------
     async def _chat_is_visible(self, page: Page) -> bool:
         try:
@@ -563,7 +658,7 @@ class DiscordScraper:
             return False
 
     # ------------------------------------------------------------------
-    # Ensure browser and login (launch once)
+    # Ensure browser and login (launch once, with token init script)
     # ------------------------------------------------------------------
     async def _ensure_browser_and_login(self):
         if self._browser_ready and self.context is not None:
@@ -1011,7 +1106,6 @@ class DiscordScraper:
 
         logger.info(f"[POLL] Starting for {len(self.channels)} channel(s)")
 
-        # Launch browser ONCE
         try:
             await self._ensure_browser_and_login()
             await self._log_memory("after-launch")
