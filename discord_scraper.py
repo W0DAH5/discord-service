@@ -1,3 +1,4 @@
+# discord_scraper.py
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +22,7 @@ from utils import sanitize_filename, unlink_quiet
 
 logger = logging.getLogger(__name__)
 
+# ---------- Robust JavaScript extraction ----------
 _EXTRACT_JS = r"""
 () => {
     const CDN_HOSTS = [
@@ -46,57 +48,62 @@ _EXTRACT_JS = r"""
         return url.split('#')[0];
     }
 
-    function extractFromElement(el) {
+    function extractUrls(element) {
         const urls = new Set();
-        el.querySelectorAll('a[href]').forEach(a => {
+        element.querySelectorAll('a[href]').forEach(a => {
             const href = a.getAttribute('href');
             if (href && isMediaUrl(href)) urls.add(cleanUrl(href));
         });
-        el.querySelectorAll('img[src]').forEach(img => {
+        element.querySelectorAll('img[src]').forEach(img => {
             const src = img.getAttribute('src');
             if (src && isMediaUrl(src)) urls.add(cleanUrl(src));
         });
-        el.querySelectorAll('video[src]').forEach(video => {
+        element.querySelectorAll('video[src]').forEach(video => {
             const src = video.getAttribute('src');
             if (src && isMediaUrl(src)) urls.add(cleanUrl(src));
         });
-        el.querySelectorAll('[data-attachment-url]').forEach(d => {
-            const url = d.getAttribute('data-attachment-url');
+        element.querySelectorAll('[data-attachment-url]').forEach(el => {
+            const url = el.getAttribute('data-attachment-url');
             if (url && isMediaUrl(url)) urls.add(cleanUrl(url));
         });
-        el.querySelectorAll('[style*="discordapp"]').forEach(d => {
-            const style = d.getAttribute('style') || '';
+        element.querySelectorAll('[style*="discordapp"]').forEach(el => {
+            const style = el.getAttribute('style') || '';
             const matches = style.match(/url\(['"]?([^'")\s]+)['"]?\)/g) || [];
             matches.forEach(m => {
                 const inner = m.replace(/^url\(['"]?/, '').replace(/['"]?\)$/, '');
                 if (isMediaUrl(inner)) urls.add(cleanUrl(inner));
             });
         });
-        return [...urls].filter(Boolean);
+        return [...urls];
     }
 
     const messages = [];
     const seenIds = new Set();
 
-    const contentElements = document.querySelectorAll('[id^="message-content-"]');
-    contentElements.forEach(el => {
-        const idAttr = el.id;
-        const msgId = idAttr.replace(/^message-content-/, '');
+    // ----- Strategy 1: data-list-item-id (historically stable) -----
+    document.querySelectorAll('[data-list-item-id]').forEach(el => {
+        let rawId = el.getAttribute('data-list-item-id') || '';
+        let msgId = rawId;
+        if (msgId.includes('___')) msgId = msgId.split('___').pop();
+        const segments = msgId.split('-');
+        const last = segments[segments.length - 1];
+        if (/^\d+$/.test(last)) msgId = last;
         if (!msgId || seenIds.has(msgId)) return;
         seenIds.add(msgId);
 
-        let container = el.closest('div[class*="message"], li[role="article"]');
-        if (!container) container = el.parentElement;
+        let ts = el.getAttribute('data-timestamp') || '';
+        if (!ts) {
+            const timeEl = el.querySelector('time[datetime]');
+            if (timeEl) ts = timeEl.getAttribute('datetime') || '';
+        }
 
-        let ts = '';
-        const timeEl = document.getElementById('message-timestamp-' + msgId);
-        if (timeEl) ts = timeEl.getAttribute('datetime') || '';
+        let text = '';
+        const textEl = el.querySelector('[class*="messageContent"], [id^="message-content-"], [class*="markup-"], span[class*="text-"]');
+        if (textEl) text = (textEl.innerText || '').slice(0, 2000);
 
-        let text = (el.innerText || '').slice(0, 2000);
-
-        const attachments = extractFromElement(container);
-        container.querySelectorAll('div[class*="embed"], div[class*="attachment"], div[class*="imageContainer"]').forEach(embed => {
-            extractFromElement(embed).forEach(u => {
+        const attachments = extractUrls(el);
+        el.querySelectorAll('[class*="embed"], [class*="attachment"], [class*="imageContainer"]').forEach(embed => {
+            extractUrls(embed).forEach(u => {
                 if (!attachments.includes(u)) attachments.push(u);
             });
         });
@@ -104,12 +111,39 @@ _EXTRACT_JS = r"""
         messages.push({ id: msgId, timestamp: ts, text, attachments });
     });
 
+    // ----- Strategy 2: fallback to generic message containers -----
+    if (messages.length === 0) {
+        const messageContainers = document.querySelectorAll('div[class*="message-"], li[role="article"]');
+        messageContainers.forEach(el => {
+            let msgId = null;
+            const timeEl = el.querySelector('time[datetime]');
+            const idEl = el.querySelector('[id*="message-"]');
+            if (idEl) msgId = idEl.id.replace(/[^0-9]/g, '');
+            if (!msgId && timeEl) msgId = timeEl.getAttribute('id')?.replace(/[^0-9]/g, '');
+            if (!msgId) msgId = Math.random().toString(36).substr(2, 9);
+            if (!msgId || seenIds.has(msgId)) return;
+            seenIds.add(msgId);
+
+            const ts = timeEl ? timeEl.getAttribute('datetime') : '';
+            const textEl = el.querySelector('[class*="messageContent"], [id^="message-content-"]');
+            const text = textEl ? (textEl.innerText || '').slice(0, 2000) : '';
+            const attachments = extractUrls(el);
+            el.querySelectorAll('[class*="embed"], [class*="attachment"]').forEach(embed => {
+                extractUrls(embed).forEach(u => {
+                    if (!attachments.includes(u)) attachments.push(u);
+                });
+            });
+            messages.push({ id: msgId, timestamp: ts, text, attachments });
+        });
+    }
+
     return messages;
 }
 """
 
 
 class DiscordScraper:
+    # Fallback guild ID (used when no mapping is provided)
     GUILD_ID = "1510277023694590062"
 
     DISCORD_CDN_DOMAINS = {
@@ -120,12 +154,16 @@ class DiscordScraper:
         "images-ext-2.discordapp.net",
     }
 
+    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg", ".avif"}
+    VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".mpg", ".mpeg", ".avi", ".flv"}
+    DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".doc", ".docx", ".zip", ".rar", ".7z"}
+
     def __init__(
         self,
         email: str,
         password: str | None,
         channels: list[str],
-        transformer: MediaTransformer,                          # <-- THIS MUST BE HERE
+        transformer: MediaTransformer,  # may be unused in standalone, kept for compatibility
         on_message_callback: Callable[[Any, SourceInfo], Coroutine[Any, Any, bool]],
         data_dir: Path,
         headless: bool = False,
@@ -143,9 +181,10 @@ class DiscordScraper:
         self.headless = headless
         self.store = store
         self.run_lock = run_lock or asyncio.Lock()
-        self._channel_guilds = dict(channel_guilds or {})
 
-        # … rest of __init__ exactly as in the last update
+        # Pre-populate guild mapping from external config
+        self._channel_guilds: dict[str, str] = dict(channel_guilds or {})
+
         self.start_date: datetime | None = None
         if start_date:
             try:
@@ -165,11 +204,16 @@ class DiscordScraper:
         self._download_stats = {"success": 0, "failed": 0, "total_bytes": 0}
         self.user_data_dir = data_dir / "chrome_user_data"
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Internal flag to track if browser is launched
         self._browser_ready = False
         self._playwright = None
 
+        # In-memory last processed ID per channel (since store is not always available)
+        self._last_processed: dict[str, int] = {}
+
     # ------------------------------------------------------------------
-    # Browser lifecycle
+    # Browser lifecycle (deferred)
     # ------------------------------------------------------------------
     def _get_browser_args(self) -> list[str]:
         return [
@@ -200,6 +244,7 @@ class DiscordScraper:
         )
 
     async def _ensure_browser_and_login(self):
+        """Launch browser and ensure login – called only when we hold the lock."""
         if self._browser_ready and self.context is not None:
             return
 
@@ -208,12 +253,15 @@ class DiscordScraper:
         self.context = await self._create_browser_context(self._playwright)
         self._page = await self.context.new_page()
 
-        # Use first channel's guild if available, otherwise fallback
+        # Determine test URL using the first channel's guild ID (if available)
         test_channel = self.channels[0] if self.channels else None
-        guild_id = self.GUILD_ID
         if test_channel and test_channel in self._channel_guilds:
             guild_id = self._channel_guilds[test_channel]
-        test_url = f"https://discord.com/channels/{guild_id}/{test_channel}" if test_channel else "https://discord.com/channels/@me"
+            test_url = f"https://discord.com/channels/{guild_id}/{test_channel}"
+        else:
+            guild_id = self.GUILD_ID
+            test_url = f"https://discord.com/channels/{guild_id}/{test_channel}" if test_channel else "https://discord.com/channels/@me"
+
         logger.info(f"Test URL: {test_url}")
         await self._page.goto(test_url, wait_until="networkidle")
         await asyncio.sleep(2)
@@ -243,6 +291,7 @@ class DiscordScraper:
         self._browser_ready = True
 
     async def _close_browser(self):
+        """Close the browser to free memory – called after releasing the lock."""
         if self.context is not None:
             try:
                 if self._page:
@@ -314,6 +363,7 @@ class DiscordScraper:
             return False
 
     async def _navigate_to_channel(self, channel_id: str) -> Page:
+        """Navigate the shared page to the given channel."""
         if self._page is None or not await self._page_alive(self._page):
             logger.warning("Page is dead – recreating")
             self._page = await self.context.new_page()
@@ -327,10 +377,12 @@ class DiscordScraper:
             logger.warning("Session expired – re-logging in")
             await self._perform_login(page)
 
+        # Use guild ID from mapping, fallback to class constant
         guild_id = self._channel_guilds.get(channel_id, self.GUILD_ID)
         if not guild_id:
             raise ValueError(f"No guild ID for channel {channel_id}")
         target = f"https://discord.com/channels/{guild_id}/{channel_id}"
+        logger.info(f"Navigating to: {target}")
         await page.goto(target, wait_until="networkidle", timeout=30000)
 
         if "/login" in page.url or "/download" in page.url:
@@ -340,6 +392,7 @@ class DiscordScraper:
 
         await self._wait_for_chat(page)
 
+        # Learn guild ID from URL (if not already known)
         m = re.search(r"/channels/(\d+)/(\d+)", page.url)
         if m:
             self._channel_guilds[channel_id] = m.group(1)
@@ -555,10 +608,6 @@ class DiscordScraper:
 
     async def _get_new_messages(self, channel_id: str, page: Page) -> list[dict]:
         initial_load = not self._initial_load_done.get(channel_id, False)
-        # For standalone service, store is not used; we keep the last processed in memory
-        # We'll store last processed per channel in a dict
-        if not hasattr(self, '_last_processed'):
-            self._last_processed = {}
         last_id = self._last_processed.get(channel_id, 0)
 
         max_scrolls = 500 if initial_load else 15
@@ -589,7 +638,6 @@ class DiscordScraper:
         for msg in new_msgs:
             self._known_message_ids[channel_id].add(msg["id"])
 
-        # Update last processed ID
         if new_msgs:
             max_id = max(int(m["id"]) for m in new_msgs)
             self._last_processed[channel_id] = max_id
@@ -673,6 +721,9 @@ class DiscordScraper:
         self._known_message_ids[channel_id] = set()
         self._initial_load_done[channel_id] = False
 
+    # ------------------------------------------------------------------
+    # Process message
+    # ------------------------------------------------------------------
     async def _process_message(self, msg: dict, source_info: SourceInfo):
         class _MsgWrapper:
             def __init__(self, d):
