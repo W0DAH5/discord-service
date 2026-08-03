@@ -427,27 +427,40 @@ class DiscordScraper:
     # Message loading
     # ------------------------------------------------------------------
     async def _find_scroller(self, page: Page):
+        # Try a wider set of selectors that match current Discord
         selectors = [
+            'div[data-list-id="chat-messages"]',
             'div[class*="scroller-"][class*="messages"]',
             'div[class*="scroller-"][role="list"]',
-            'ol[class*="scrollerInner"]',
-            'div[class*="messagesWrapper"] div[class*="scroller"]',
-            'div[class*="chatContent"] div[class*="scroller"]',
-            '[data-list-id="chat-messages"]',
+            'div[class*="scroller-"]',
             'div[role="list"]',
+            'main[class*="chatContent"] div[class*="scroller"]',
+            'div[class*="chatContent"] div[class*="scroller"]',
         ]
         for sel in selectors:
             try:
                 el = await page.query_selector(sel)
                 if el:
+                    # Check if the element itself is scrollable
                     scrollable = await el.evaluate(
                         "e => e.scrollHeight > e.clientHeight + 5"
                     )
                     if scrollable:
+                        logger.info(f"Scroller found using selector: {sel}")
                         return el
+                    # If not, check its parent
+                    parent = await el.evaluate_handle("e => e.parentElement")
+                    if parent:
+                        parent_scrollable = await parent.evaluate(
+                            "e => e.scrollHeight > e.clientHeight + 5"
+                        )
+                        if parent_scrollable:
+                            logger.info(f"Scroller found as parent of: {sel}")
+                            return parent
             except Exception:
                 continue
 
+        # Fallback: find any scrollable div
         el = await page.evaluate_handle("""
             () => {
                 let best = null, bestH = 0;
@@ -467,9 +480,12 @@ class DiscordScraper:
         try:
             is_null = await el.evaluate("e => e === null")
             if not is_null:
+                logger.info("Scroller found via fallback")
                 return el
         except Exception:
             pass
+
+        logger.warning("No scroller found – falling back to window scroll")
         return None
 
     async def _load_messages(self, page: Page, max_scrolls: int = 10) -> list[dict]:
@@ -523,6 +539,14 @@ class DiscordScraper:
             except Exception as e:
                 logger.warning(f"JS extraction error at scroll {i}: {e}")
                 message_data = []
+
+            # Debug: save HTML and screenshot if no messages extracted
+            if not message_data:
+                html = await page.content()
+                with open("/tmp/discord_page.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                await page.screenshot(path="/tmp/discord_page.png")
+                logger.warning("No messages extracted. Saved HTML and screenshot to /tmp")
 
             new_count = 0
             for data in message_data:
@@ -604,7 +628,7 @@ class DiscordScraper:
         initial_load = not self._initial_load_done.get(channel_id, False)
         last_id = self._last_processed.get(channel_id, 0)
 
-        max_scrolls = 500 if initial_load else 15
+        max_scrolls = 500 if initial_load else 50
         all_msgs = await self._load_messages(page, max_scrolls=max_scrolls)
 
         if not all_msgs:
