@@ -142,6 +142,7 @@ _EXTRACT_JS = r"""
 
 
 class DiscordScraper:
+    # Fallback guild ID (used when no mapping is provided)
     GUILD_ID = "1510277023694590062"
 
     DISCORD_CDN_DOMAINS = {
@@ -168,6 +169,7 @@ class DiscordScraper:
         start_date: str | None = None,
         store: Optional[Store] = None,
         run_lock: Optional[asyncio.Lock] = None,
+        channel_guilds: Optional[dict[str, str]] = None,   # new parameter
     ):
         self.email = email
         self.password = password
@@ -178,6 +180,9 @@ class DiscordScraper:
         self.headless = headless
         self.store = store
         self.run_lock = run_lock or asyncio.Lock()
+
+        # Pre-populate guild mapping from external config
+        self._channel_guilds: dict[str, str] = dict(channel_guilds or {})
 
         self.start_date: datetime | None = None
         if start_date:
@@ -191,7 +196,6 @@ class DiscordScraper:
         self._page: Page | None = None
         self._running = False
         self._known_message_ids: dict[str, set[str]] = {}
-        self._channel_guilds: dict[str, str] = {}
         self._last_poll: dict[str, float] = {}
         self._initial_load_done: dict[str, bool] = {}
 
@@ -365,8 +369,11 @@ class DiscordScraper:
             logger.warning("Session expired – re-logging in")
             await self._perform_login(page)
 
-        guild = self._channel_guilds.get(channel_id, self.GUILD_ID)
-        target = f"https://discord.com/channels/{guild}/{channel_id}"
+        # Use guild ID from mapping (pre-populated or learned), fallback to class constant
+        guild_id = self._channel_guilds.get(channel_id, self.GUILD_ID)
+        if not guild_id:
+            raise ValueError(f"No guild ID for channel {channel_id}")
+        target = f"https://discord.com/channels/{guild_id}/{channel_id}"
         await page.goto(target, wait_until="networkidle", timeout=30000)
 
         if "/login" in page.url or "/download" in page.url:
@@ -376,6 +383,7 @@ class DiscordScraper:
 
         await self._wait_for_chat(page)
 
+        # Learn guild ID from URL (if not already known)
         m = re.search(r"/channels/(\d+)/(\d+)", page.url)
         if m:
             self._channel_guilds[channel_id] = m.group(1)

@@ -41,20 +41,27 @@ async def fetch_discord_sources(retries=5, delay=5):
                         data = await resp.json()
                         sources = data.get("sources", [])
                         discord_sources = [s for s in sources if s["platform"] == "discord" and s["enabled"]]
-                        channel_ids = [s["channel_id"] for s in discord_sources]
-                        logger.info(f"Fetched {len(channel_ids)} Discord sources")
-                        return channel_ids
+                        channel_ids = []
+                        channel_guilds = {}
+                        for s in discord_sources:
+                            channel_id = s["channel_id"]
+                            guild_id = s.get("filters", {}).get("guild_id")
+                            if guild_id:
+                                channel_guilds[channel_id] = guild_id
+                            channel_ids.append(channel_id)
+                        logger.info(f"Fetched {len(channel_ids)} Discord sources (guilds for {len(channel_guilds)})")
+                        return channel_ids, channel_guilds
                     elif resp.status in (429, 502, 503):
                         logger.warning(f"Received HTTP {resp.status}, retrying in {delay}s...")
                         await asyncio.sleep(delay * attempt)
                     else:
                         logger.error(f"Failed to fetch sources: {resp.status}")
-                        return []
+                        return [], {}
         except Exception as e:
             logger.error(f"Error fetching sources (attempt {attempt}): {e}")
             await asyncio.sleep(delay * attempt)
     logger.error("Max retries exceeded for fetching sources")
-    return []
+    return [], {}
 
 # --- Forwarding function ---
 async def forward_to_backend(channel_id, message_id, attachments, timestamp):
@@ -113,7 +120,7 @@ async def start_http_server():
 # --- Main loop with dynamic refresh ---
 async def main():
     # Initial fetch
-    channels = await fetch_discord_sources()
+    channels, channel_guilds = await fetch_discord_sources()
     if not channels:
         logger.warning("No Discord sources found. Will retry every 60 seconds.")
 
@@ -127,7 +134,8 @@ async def main():
         data_dir=DATA_DIR,
         headless=True,
         store=None,
-        run_lock=None
+        run_lock=None,
+        channel_guilds=channel_guilds,          # pass guild mapping
     )
 
     await scraper.start()
@@ -139,21 +147,26 @@ async def main():
 
     # Background task: refresh sources every 60 seconds
     async def refresh_loop():
-        nonlocal channels, scraper, poll_task
+        nonlocal channels, channel_guilds, scraper, poll_task
         while True:
             await asyncio.sleep(60)
-            new_channels = await fetch_discord_sources()
-            if new_channels is not None and set(new_channels) != set(channels):
-                logger.info(f"Channel list changed: {new_channels}")
+            new_channels, new_guilds = await fetch_discord_sources()
+            if new_channels is not None and (
+                set(new_channels) != set(channels) or
+                new_guilds != channel_guilds
+            ):
+                logger.info(f"Channel list or guild mapping changed. Channels: {new_channels}")
                 poll_task.cancel()
                 try:
                     await poll_task
                 except asyncio.CancelledError:
                     pass
                 scraper.channels = new_channels
+                scraper._channel_guilds = new_guilds
                 scraper._known_message_ids.clear()
                 scraper._initial_load_done.clear()
                 channels = new_channels
+                channel_guilds = new_guilds
                 poll_task = asyncio.create_task(scraper.poll_channels())
 
     refresh_task = asyncio.create_task(refresh_loop())
